@@ -6,6 +6,18 @@
 
 使用 Android Studio 打开本目录，配置 JDK 17 与 Android SDK Platform 35 后同步 Gradle。命令行可运行 `./gradlew assembleDebug`，Windows 使用 `gradlew.bat assembleDebug`。本机 SDK 路径保存在 `local.properties`，由各自开发环境生成。
 
+## 界面演示
+
+在 Android 模拟器上运行墨映 1.9.39，使用「山谷列车」主题和本地示例片单。
+
+| 首页 | 播放页 | 观看历史 | 外观设置 |
+| --- | --- | --- | --- |
+| <img src="docs/screenshots/home.jpg" width="220" alt="首页的玻璃导航、继续观看和推荐海报"> | <img src="docs/screenshots/player.jpg" width="220" alt="播放页的影片画面、进度条、片头设置和选集"> | <img src="docs/screenshots/history.jpg" width="220" alt="观看历史页的续播进度"> | <img src="docs/screenshots/appearance.jpg" width="220" alt="外观设置中的主题套装"> |
+
+## 开源许可
+
+墨映自有源码及相应开发文档采用 [MIT 许可证](LICENSE)。第三方代码、依赖及工具按各自的许可和版权声明使用，其中 Kyant Backdrop 的移植部分保留 [Apache 2.0 许可证](app/src/main/assets/licenses/Kyant-Backdrop-Apache-2.0.txt)。影视海报、壁纸、演示媒体和第三方二进制文件的权利按各自的授权处理。[第三方声明](THIRD_PARTY_NOTICES.md) · [资源说明](ASSETS.md)
+
 深浅主题、三列海报、蓝色强调的影视界面，包含首页、播放页、观看历史三个 Screen。使用 Compose Foundation 自绘组件，不引入 Material Compose 组件库、DI 框架、Navigation 库或额外 module。
 
 ## 1.8.6 更新
