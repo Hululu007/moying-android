@@ -26,11 +26,11 @@ APK 支持 Android 8.0 及以上。完整的液态玻璃效果需要 Android 13 
 
 ## 界面演示
 
-截图来自运行墨映 1.9.39 的 Android 模拟器，使用「山谷列车」主题和本地示例片单。应用支持调节液态玻璃、切换深浅色模式、设置时间主题及更换壁纸。
+以下是墨映 1.9.39 在 Android 模拟器上的实拍截图。演示使用内置「暴风」片源，海报和《夜曲》的播放画面均为应用联网加载。外观设置支持调节液态玻璃、切换深浅色模式、设置时间主题及更换壁纸。
 
 | 首页 | 播放页 | 观看历史 | 外观设置 |
 | --- | --- | --- | --- |
-| <img src="docs/screenshots/home.jpg" width="220" alt="首页的玻璃导航、继续观看和推荐海报"> | <img src="docs/screenshots/player.jpg" width="220" alt="播放页的影片画面、进度条、片头设置和选集"> | <img src="docs/screenshots/history.jpg" width="220" alt="观看历史页的续播进度"> | <img src="docs/screenshots/appearance.jpg" width="220" alt="外观设置中的主题套装"> |
+| <img src="docs/screenshots/home.jpg" width="220" alt="墨映首页的暴风片源、继续观看和在线海报"> | <img src="docs/screenshots/player.jpg" width="220" alt="墨映在线播放《夜曲》时的画面、进度条、片头设置和选集"> | <img src="docs/screenshots/history.jpg" width="220" alt="墨映观看历史中的《夜曲》和续播进度"> | <img src="docs/screenshots/appearance.jpg" width="220" alt="墨映外观设置中的主题套装"> |
 
 ## 开源许可
 
