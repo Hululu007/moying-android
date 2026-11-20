@@ -1,0 +1,54 @@
+Moying 1.4.0 third-party code notice
+
+This application contains modified portions of Kyant0/AndroidLiquidGlass.
+Copyright 2025 Kyant. Licensed under the Apache License, Version 2.0.
+The complete license is included in Kyant-Backdrop-Apache-2.0.txt in this folder.
+
+Source: https://github.com/Kyant0/AndroidLiquidGlass
+Commit: 65ab177e90e5c1d8c62e70cf7755841982da65f6
+Original files: backdrop/internal/Shaders.kt, backdrops/LayerBackdrop.kt,
+backdrops/LayerBackdropModifier.kt, DrawBackdropModifier.kt,
+catalog/components/LiquidBottomTabs.kt (full paths in source headers/report).
+
+Modified 2026-11-02: Android-only Compose 1.7.6 lifecycle and page isolation;
+GPU projection into the existing bottom navigation; dual lens and touch optics;
+three-tap dispersion; restrained environment lighting; interruptible springs;
+cached shader/blur and parameter-dependent RuntimeShaderEffect snapshots.
+
+Modified 2026-11-03: reused the existing SDF, analytic normal and directional
+lighting for a tunable inner specular band and repositioned existing shadow;
+background luminance is reused without additional texture samples or passes.
+
+Revised 2026-11-03: replaced the narrow inner band and duplicate Canvas rims
+with shared curved-surface lighting; serial feathered lens coordinates and
+capsule magnification keep the original background sampling/render pipeline.
+
+Revised 2026-11-03: all video controls reuse the navigation shader, uniform
+binder and GPU blur chain, with an isolated RenderNode for existing video frames.
+
+Revised 2026-11-03: added bounded local release distortion to the same shader,
+with shared lifecycle-aware touch state; the center remains planar at rest.
+
+No upstream build scripts, Gradle plugins, Catalog assets or additional library
+dependencies are included. Other evaluated projects were not copied.
+
+Revised 2026-11-03 (1.7.4): reused rounded refraction, original seven-color
+dispersion weights and DefaultHighlight from the supplied Backdrop Catalog
+APK. All four shader strings match the licensed upstream Shaders.kt at the
+commit above exactly. Lens/highlight adapted to the existing padded renderer;
+retained Moying navigation springs, haptics, release waves and video lifecycle.
+
+Modified 2026-11-03 (1.7.5): adapted Catalog LiquidBottomTabs combined backdrop
+and independent expanding lens; LiquidSlider and DampedDragAnimation spring
+parameters; ScrollContainer/LazyScrollContainer clear 16dp/32dp lenses; and
+GlassPlaygroundContent/InteractiveHighlight depth lens and local press light.
+Source files are in catalog/components, catalog/destinations and catalog/utils
+at the same licensed commit above. The app keeps its stable Compose 1.7.6
+renderer, movie data, player interface and lifecycle. Slider dragging previews
+locally and commits a single seek. Each recommendation captures only its own
+poster; foreground labels never enter their own sampled backdrop.
+
+Modified 2026-11-03 (1.7.6): matched Catalog Bottom Tabs geometry and linked the
+existing liquid lens, icon color and scale directly to a stable three-page
+Compose Pager. Gesture velocity guides the release target; one paging state
+owns navigation settlement and bounds offscreen playback activity.

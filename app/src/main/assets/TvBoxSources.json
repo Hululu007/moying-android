@@ -1,0 +1,24 @@
+{
+  "repository": "https://github.com/noimank/tvbox",
+  "entry": "https://raw.githubusercontent.com/noimank/tvbox/main/tvboxmuti.json",
+  "snapshot": "2026-11-02",
+  "compatibility": "Only direct AppleCMS JSON/XML and public M3U playlists; Spider/Jar sites are excluded.",
+  "verification": "CMS list endpoints and direct-media URL fields were checked on 2026-11-02; this is not a guarantee of every media URL or future availability.",
+  "sites": [
+    {"key":"bfzy","name":"暴风","type":1,"api":"https://bfzyapi.com/api.php/provide/vod","config":"https://clun.top/box.json"},
+    {"key":"sony","name":"索尼","type":1,"api":"https://suoniapi.com/api.php/provide/vod","config":"https://clun.top/box.json"},
+    {"key":"lzi","name":"量子","type":1,"api":"https://cj.lziapi.com/api.php/provide/vod","config":"https://clun.top/box.json"},
+    {"key":"360","name":"360","type":1,"api":"https://360zy.com/api.php/provide/vod/","config":"https://clun.top/box.json"},
+    {"key":"wujin","name":"无尽","type":1,"api":"https://api.wujinapi.me/api.php/provide/vod/?ac=list","config":"https://gh-proxy.com/raw.githubusercontent.com/yw88075/tvbox/main/yw.json"},
+    {"key":"ffzy","name":"非凡","type":1,"api":"https://cj.ffzyapi.com/api.php/provide/vod/","config":"https://clun.top/box.json"},
+    {"key":"hongniu","name":"红牛","type":1,"api":"https://www.hongniuzy2.com/api.php/provide/vod/","config":"https://raw.githubusercontent.com/yw88075/tvbox/main/yw.json"},
+    {"key":"guangsu","name":"光速","type":1,"api":"https://api.guangsuapi.com/api.php/provide/vod/from/gsm3u8/","config":"https://raw.githubusercontent.com/yw88075/tvbox/main/yw.json"},
+    {"key":"youzhi","name":"优质","type":1,"api":"https://api.1080zyku.com/inc/api_mac10.php","config":"https://raw.githubusercontent.com/yw88075/tvbox/main/yw.json"},
+    {"key":"xinlang","name":"新浪","type":1,"api":"https://api.xinlangapi.com/xinlangapi.php/provide//vod/","config":"https://raw.githubusercontent.com/yw88075/tvbox/main/yw.json"},
+    {"key":"baidu","name":"百度","type":1,"api":"https://api.apibdzy.com/api.php/provide/vod/","config":"https://raw.githubusercontent.com/yw88075/tvbox/main/yw.json"},
+    {"key":"shandian","name":"闪电","type":1,"api":"https://sdzyapi.com/api.php/provide/vod/","config":"https://raw.githubusercontent.com/yw88075/tvbox/main/yw.json"},
+    {"key":"taopian","name":"淘片","type":1,"api":"https://taopianapi.com/cjapi/mc/vod/json.html","config":"https://raw.githubusercontent.com/yw88075/tvbox/main/yw.json"},
+    {"key":"iptv-zho","name":"公开直播 · 中文","type":1,"format":"m3u","api":"https://iptv-org.github.io/iptv/languages/zho.m3u","config":"https://github.com/iptv-org/iptv"},
+    {"key":"iptv-news","name":"公开直播 · 新闻","type":1,"format":"m3u","api":"https://iptv-org.github.io/iptv/categories/news.m3u","config":"https://github.com/iptv-org/iptv"}
+  ]
+}

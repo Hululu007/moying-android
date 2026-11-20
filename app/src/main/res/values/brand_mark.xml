@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- One original silhouette for launcher, monochrome and in-app branding. -->
+    <string name="brand_mark_path" translatable="false">M34,76 C30,76 28,73 29,69 L34,36 C34,33 36,31 40,31 H45 C47,31 48,32 49,34 L55,43 L64,33 C65,32 66,31 68,31 H74 C78,31 80,34 79,38 L74,71 C74,74 71,76 68,76 Z M46,48 C46,47 47,46 48,47 L63,55 C65,56 65,58 63,59 L47,68 C46,69 44,68 44,67 Z</string>
+</resources>

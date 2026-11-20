@@ -1,0 +1,89 @@
+{
+  "movies": [
+    {
+      "id": "bbb",
+      "title": "大雄兔",
+      "category": "动漫",
+      "year": "2008",
+      "region": "",
+      "genres": "喜剧 / 冒险",
+      "poster": "open-bbb.jpg",
+      "backdrop": "open-bbb.jpg",
+      "synopsis": "一只善良的大兔子，在森林里遇上一群爱恶作剧的小动物。",
+      "episodes": [
+        {
+          "name": "正片",
+          "url": "https://media.w3.org/2010/05/bunny/movie.mp4"
+        }
+      ],
+      "credit": "© 2008 Blender Foundation · www.bigbuckbunny.org",
+      "sourcePage": "https://peach.blender.org/about/",
+      "license": "CC BY 3.0",
+      "licenseUrl": "https://creativecommons.org/licenses/by/3.0/"
+    },
+    {
+      "id": "sintel",
+      "title": "辛特尔",
+      "category": "动漫",
+      "year": "2010",
+      "region": "",
+      "genres": "奇幻 / 冒险",
+      "poster": "open-sintel.jpg",
+      "backdrop": "open-sintel.jpg",
+      "synopsis": "少女为了寻找失散的小龙，独自踏上穿越雪原与群山的旅程。",
+      "episodes": [
+        {
+          "name": "正片",
+          "url": "https://archive.org/download/Sintel/sintel-2048-stereo_512kb.mp4"
+        }
+      ],
+      "credit": "© Blender Foundation · www.sintel.org",
+      "sourcePage": "https://durian.blender.org/sharing/",
+      "license": "CC BY 3.0",
+      "licenseUrl": "https://creativecommons.org/licenses/by/3.0/"
+    },
+    {
+      "id": "tears-of-steel",
+      "title": "钢铁之泪",
+      "category": "电影",
+      "year": "2012",
+      "region": "",
+      "genres": "科幻 / 剧情",
+      "poster": "open-tears.jpg",
+      "backdrop": "open-tears.jpg",
+      "synopsis": "未来的阿姆斯特丹，一支小队尝试通过重现过去，阻止人类与机器的冲突。",
+      "episodes": [
+        {
+          "name": "正片",
+          "url": "https://archive.org/download/Tears-of-Steel/tears_of_steel_720p.mp4"
+        }
+      ],
+      "credit": "© Blender Foundation · mango.blender.org",
+      "sourcePage": "https://mango.blender.org/about/",
+      "license": "CC BY 3.0",
+      "licenseUrl": "https://creativecommons.org/licenses/by/3.0/"
+    },
+    {
+      "id": "elephants-dream",
+      "title": "大象之梦",
+      "category": "动漫",
+      "year": "2006",
+      "region": "",
+      "genres": "科幻 / 奇幻",
+      "poster": "open-elephants.jpg",
+      "backdrop": "open-elephants.jpg",
+      "synopsis": "两个性格迥异的旅人，穿行在一座超现实的机械世界，逐渐走向彼此想象的边界。",
+      "episodes": [
+        {
+          "name": "正片",
+          "url": "https://archive.org/download/ElephantsDream/ed_1024.mp4"
+        }
+      ],
+      "credit": "© 2006 Blender Foundation / Netherlands Media Art Institute · www.elephantsdream.org",
+      "sourcePage": "https://orange.blender.org/page/2/",
+      "license": "CC BY 2.5",
+      "licenseUrl": "https://creativecommons.org/licenses/by/2.5/"
+    }
+  ],
+  "defaultMediaId": "bbb"
+}
