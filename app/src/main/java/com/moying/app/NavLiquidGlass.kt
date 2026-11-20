@@ -44,6 +44,7 @@ import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.zIndex
 import kotlin.math.abs
@@ -109,6 +110,7 @@ fun NavLiquidGlass(
     val ambient = if (glassEnabled) LocalAmbientBackdrop.current else null
     val feedback = LocalInteractionHaptics.current
     val density = LocalDensity.current
+    val windowFocused = LocalWindowInfo.current.isWindowFocused
     // Keep the compiled material and its last uniform snapshot across switch changes.
     val material by remember(density.density) {
         lazy(LazyThreadSafetyMode.NONE) { createNavigationGlassEffect(density.density, CatalogGlassStyle.BOTTOM_TABS) }
@@ -116,7 +118,7 @@ fun NavLiquidGlass(
     val glassLayer = rememberGraphicsLayer()
     val animationScope = rememberCoroutineScope()
     var coordinates by remember { mutableStateOf<LayoutCoordinates?>(null, neverEqualPolicy()) }
-    val touchInteraction = rememberGlassTouchInteraction()
+    val touchInteraction = rememberGlassTouchInteraction(enabled = windowFocused)
     var dragging by remember { mutableStateOf(false) }
     var navigationWidth by remember { mutableFloatStateOf(1f) }
     var dragVelocity by remember { mutableFloatStateOf(0f) }
@@ -182,7 +184,8 @@ fun NavLiquidGlass(
         val availableX = (Theme.BottomTabsGlass.SideInset.toPx() - size.width * Theme.NavGlass.TetherScaleX / 2f - Theme.Space.Hairline.toPx()).coerceAtLeast(0f)
         translationX = pull.offset.x.coerceIn(-availableX, availableX)
         translationY = scrollState?.offsetY ?: 0f
-    }.observeGlassTouch(touchInteraction).pointerInput(itemCount, density.density) {
+    }.observeGlassTouch(touchInteraction).pointerInput(itemCount, density.density, windowFocused) {
+        if (!windowFocused) return@pointerInput
         var startPosition = 0f
         var startIndex = 0
         var distance = 0f
@@ -194,75 +197,88 @@ fun NavLiquidGlass(
         val horizontalLimit = with(density) { Theme.NavGlass.HorizontalTether.toPx() }
         val inset = with(density) { Theme.NavGlass.CapsuleInset.toPx() }
         fun tabWidth() = ((navigationWidth - inset * 2f) / itemCount.coerceAtLeast(1)).coerceAtLeast(1f)
-        detectHorizontalDragGestures(
-            onDragStart = { point ->
-                latestOnDragStart()
-                startPosition = selectionPosition.value
-                startIndex = startPosition.roundToInt().coerceIn(0, (itemCount - 1).coerceAtLeast(0))
-                distance = 0f
-                lastBounded = startPosition
-                lastMoveAt = SystemClock.uptimeMillis()
-                velocityTracker.resetTracking()
-                velocityTracker.addPosition(lastMoveAt, Offset.Zero)
-                lastDetent = startIndex
-                boundarySent = false
-                dragVelocity = 0f
-                dragging = true
-                pull.stopReturning()
-                touchInteraction.moveTouch(point)
-                feedback.tap()
-                if (latestLinkedPosition == null) {
-                    animationScope.launch(start = CoroutineStart.UNDISPATCHED) { selection.stop() }
-                }
-            },
-            onDragEnd = {
-                val lastIndex = (itemCount - 1).coerceAtLeast(0)
-                velocityTracker.addPosition(SystemClock.uptimeMillis(), Offset(distance, 0f))
-                val velocity = (velocityTracker.calculateVelocity().x / tabWidth())
+        var dragInProgress = false
+        fun cancelDrag() {
+            if (!dragInProgress) return
+            dragInProgress = false
+            dragging = false
+            releaseVelocity = 0f
+            pull.stopReturning()
+            pull.offset = Offset.Zero
+            touchInteraction.reset()
+            latestOnDragCancel()
+        }
+        try {
+            detectHorizontalDragGestures(
+                onDragStart = { point ->
+                    dragInProgress = true
+                    latestOnDragStart()
+                    startPosition = selectionPosition.value
+                    startIndex = startPosition.roundToInt().coerceIn(0, (itemCount - 1).coerceAtLeast(0))
+                    distance = 0f
+                    lastBounded = startPosition
+                    lastMoveAt = SystemClock.uptimeMillis()
+                    velocityTracker.resetTracking()
+                    velocityTracker.addPosition(lastMoveAt, Offset.Zero)
+                    lastDetent = startIndex
+                    boundarySent = false
+                    dragVelocity = 0f
+                    dragging = true
+                    pull.stopReturning()
+                    touchInteraction.moveTouch(point)
+                    feedback.tap()
+                    if (latestLinkedPosition == null) {
+                        animationScope.launch(start = CoroutineStart.UNDISPATCHED) { selection.stop() }
+                    }
+                },
+                onDragEnd = {
+                    val lastIndex = (itemCount - 1).coerceAtLeast(0)
+                    velocityTracker.addPosition(SystemClock.uptimeMillis(), Offset(distance, 0f))
+                    val velocity = (velocityTracker.calculateVelocity().x / tabWidth())
+                        .coerceIn(-Theme.NavGlass.MaxSwipeVelocity, Theme.NavGlass.MaxSwipeVelocity)
+                    val target = (lastBounded + velocity * Theme.BottomTabsGlass.FlingProjectionSeconds)
+                        .roundToInt().coerceIn(0, lastIndex)
+                    releaseVelocity = velocity
+                    dragInProgress = false
+                    dragging = false
+                    pull.settle(animationScope)
+                    if (target != startIndex) feedback.confirm()
+                    latestOnDragEnd(target, velocity)
+                    if (latestLinkedPosition == null && target != latestSelected) latestOnSelected(target)
+                },
+                onDragCancel = ::cancelDrag,
+            ) { change, amount ->
+                change.consume() // 超过系统横向 slop 后取消子项点击；单击和无障碍仍交给 clickable。
+                touchInteraction.moveTouch(change.position)
+                distance += amount
+                val now = SystemClock.uptimeMillis()
+                val elapsed = if (lastMoveAt == 0L) NavigationGestureTiming.FirstEventMillis else (now - lastMoveAt).coerceAtLeast(1L)
+                lastMoveAt = now
+                val cell = tabWidth()
+                val raw = startPosition + distance / cell
+                val lastIndex = (itemCount - 1).coerceAtLeast(0).toFloat()
+                val bounded = raw.coerceIn(0f, lastIndex)
+                lastBounded = bounded
+                val overshoot = raw - bounded
+                val resisted = bounded + Theme.NavGlass.SwipeRubber * tanh(overshoot)
+                val velocity = (amount / cell / elapsed * NavigationGestureTiming.MillisPerSecond)
                     .coerceIn(-Theme.NavGlass.MaxSwipeVelocity, Theme.NavGlass.MaxSwipeVelocity)
-                val target = (lastBounded + velocity * Theme.BottomTabsGlass.FlingProjectionSeconds)
-                    .roundToInt().coerceIn(0, lastIndex)
-                releaseVelocity = velocity
-                dragging = false
-                pull.settle(animationScope)
-                if (target != startIndex) feedback.confirm()
-                latestOnDragEnd(target, velocity)
-                if (latestLinkedPosition == null && target != latestSelected) latestOnSelected(target)
-            },
-            onDragCancel = {
-                releaseVelocity = 0f
-                dragging = false
-                pull.settle(animationScope)
-                latestOnDragCancel()
-            },
-        ) { change, amount ->
-            change.consume() // 超过系统横向 slop 后取消子项点击；单击和无障碍仍交给 clickable。
-            touchInteraction.moveTouch(change.position)
-            distance += amount
-            val now = SystemClock.uptimeMillis()
-            val elapsed = if (lastMoveAt == 0L) NavigationGestureTiming.FirstEventMillis else (now - lastMoveAt).coerceAtLeast(1L)
-            lastMoveAt = now
-            val cell = tabWidth()
-            val raw = startPosition + distance / cell
-            val lastIndex = (itemCount - 1).coerceAtLeast(0).toFloat()
-            val bounded = raw.coerceIn(0f, lastIndex)
-            lastBounded = bounded
-            val overshoot = raw - bounded
-            val resisted = bounded + Theme.NavGlass.SwipeRubber * tanh(overshoot)
-            val velocity = (amount / cell / elapsed * NavigationGestureTiming.MillisPerSecond)
-                .coerceIn(-Theme.NavGlass.MaxSwipeVelocity, Theme.NavGlass.MaxSwipeVelocity)
-            dragVelocity += (velocity - dragVelocity) * Theme.NavGlass.TetherFollow
-            velocityTracker.addPosition(change.uptimeMillis, Offset(distance, 0f))
-            // A bounded rubber pull inspired by OShin's LiquidButton.
-            pull.offset = Offset(horizontalLimit * tanh(distance / cell), resisted - bounded)
-            // Pager 接收每次 move；橡皮筋仅施加给边界外的透镜，不制造第二套页码动画。
-            latestOnDragPosition(bounded)
-            if (latestLinkedPosition == null) {
-                animationScope.launch(start = CoroutineStart.UNDISPATCHED) { selection.snapTo(resisted) }
+                dragVelocity += (velocity - dragVelocity) * Theme.NavGlass.TetherFollow
+                velocityTracker.addPosition(change.uptimeMillis, Offset(distance, 0f))
+                // A bounded rubber pull inspired by OShin's LiquidButton.
+                pull.offset = Offset(horizontalLimit * tanh(distance / cell), resisted - bounded)
+                // Pager 接收每次 move；橡皮筋仅施加给边界外的透镜，不制造第二套页码动画。
+                latestOnDragPosition(bounded)
+                if (latestLinkedPosition == null) {
+                    animationScope.launch(start = CoroutineStart.UNDISPATCHED) { selection.snapTo(resisted) }
+                }
+                val detent = bounded.roundToInt()
+                if (detent != lastDetent) { feedback.detent(); lastDetent = detent }
+                if (raw !in 0f..lastIndex && !boundarySent) { feedback.boundary(); boundarySent = true }
             }
-            val detent = bounded.roundToInt()
-            if (detent != lastDetent) { feedback.detent(); lastDetent = detent }
-            if (raw !in 0f..lastIndex && !boundarySent) { feedback.boundary(); boundarySent = true }
+        } finally {
+            // Window loss or pointer modifier replacement can cancel the detector itself.
+            cancelDrag()
         }
     }.onGloballyPositioned {
         coordinates = it

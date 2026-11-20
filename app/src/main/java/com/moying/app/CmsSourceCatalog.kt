@@ -68,4 +68,4 @@ private val StandardCmsChannels = mapOf(
     "短剧" to setOf("短剧", "微短剧", "网络短剧"),
 )
 
-private fun standardChannel(name: String): String? = StandardCmsChannels.entries.firstOrNull { name in it.value }?.key
+internal fun standardChannel(name: String): String? = StandardCmsChannels.entries.firstOrNull { name in it.value }?.key

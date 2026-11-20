@@ -31,7 +31,10 @@ class HomeState internal constructor(
         val query: String,
         val revision: Int = 0,
         val filters: Map<String, String> = emptyMap(),
-    )
+    ) {
+        val isRecommendation: Boolean
+            get() = category == CatalogRecommend && query.isBlank() && filters.isEmpty()
+    }
     internal var catalogKey by mutableStateOf(CatalogKey(sourceId, category, ""))
         private set
     val sourceId: String get() = catalogKey.sourceId
@@ -50,7 +53,13 @@ class HomeState internal constructor(
         private set
     val movies = mutableStateListOf<Movie>()
     private val seenMovieIds = hashSetOf<String>()
+    private val seenRecommendationTitles = hashSetOf<Pair<String, String>>()
     private val revealedRecommendationIds = hashSetOf<String>()
+    internal var replacingRecommendations by mutableStateOf(false)
+        private set
+    internal val canReplaceRecommendations: Boolean
+        get() = catalogKey.isRecommendation && movies.isNotEmpty() &&
+            (hasMore || loadedPage > Catalog.FirstPage || replacingRecommendations)
     var page by mutableIntStateOf(Catalog.FirstPage)
         private set
     var loadedPage by mutableIntStateOf(Catalog.FirstPage - 1)
@@ -144,19 +153,43 @@ class HomeState internal constructor(
         page = Catalog.FirstPage
         loadedPage = Catalog.FirstPage - 1
         hasMore = false
-        movies.clear()
-        seenMovieIds.clear()
-        revealedRecommendationIds.clear()
+        replacingRecommendations = false
+        clearMovies()
         loading = true
         loadError = null
         if (scrollToTop) scrollReset++
     }
 
+    private fun clearMovies() {
+        movies.clear()
+        seenMovieIds.clear()
+        seenRecommendationTitles.clear()
+        revealedRecommendationIds.clear()
+    }
+
     internal fun accept(chunk: MoviePage, requestedPage: Int) {
-        if (requestedPage == Catalog.FirstPage) { movies.clear(); seenMovieIds.clear() }
-        movies.addAll(chunk.items.filter { seenMovieIds.add(it.id) })
+        // An empty page from a remote source still advances pagination, but keeps the current batch visible.
+        val replace = replacingRecommendations && chunk.items.isNotEmpty()
+        if (replace || (requestedPage == Catalog.FirstPage && !replacingRecommendations)) clearMovies()
+        val isRecommendation = catalogKey.isRecommendation
+        val unique = chunk.items.filter { movie ->
+            seenMovieIds.add(movie.id) &&
+                (!isRecommendation || seenRecommendationTitles.add(movie.recommendationTitleKey()))
+        }
+        movies.addAll(if (isRecommendation) mixHomeRecommendations(unique) else unique)
         loadedPage = requestedPage
         hasMore = chunk.hasMore
+        replacingRecommendations = false
+        if (replace) scrollReset++
+    }
+
+    internal fun replaceRecommendations() {
+        if (!canReplaceRecommendations || loading) return
+        val next = if (replacingRecommendations) page else if (hasMore) loadedPage + 1 else Catalog.FirstPage
+        replacingRecommendations = true
+        loading = true
+        loadError = null
+        if (next == page) retry++ else page = next
     }
 
     fun nextPage() {
@@ -295,7 +328,8 @@ fun rememberHomeState(repository: MovieRepository): HomeState {
     LaunchedEffect(state.catalogKey, state.page, state.retry) {
         val key = state.catalogKey
         val requestedPage = state.page
-        if (requestedPage <= state.loadedPage) return@LaunchedEffect
+        val replacing = state.replacingRecommendations
+        if (requestedPage <= state.loadedPage && !replacing) return@LaunchedEffect
         state.loading = true
         state.loadError = null
         try {
@@ -308,7 +342,11 @@ fun rememberHomeState(repository: MovieRepository): HomeState {
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (error: Exception) {
-            if (state.catalogKey == key) state.loadError = "片源暂时不可用，可切换片源或点击重试"
+            if (state.catalogKey == key) state.loadError = if (replacing) {
+                "暂时无法换一批，可重试"
+            } else {
+                "片源暂时不可用，可切换片源或点击重试"
+            }
         } finally {
             if (state.catalogKey == key) {
                 state.loading = false

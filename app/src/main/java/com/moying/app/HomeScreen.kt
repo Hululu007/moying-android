@@ -102,7 +102,7 @@ internal fun HomeScreen(
                 CompositionLocalProvider(LocalGlassTuning provides panelGlass) {
                     CatalogBrowseHeader(state, Modifier.padding(top = Theme.Space.Large))
                 }
-                val showRecommendations = state.category == CatalogRecommend && state.filters.isEmpty() && state.query.isBlank()
+                val showRecommendations = state.catalogKey.isRecommendation
                 if (resume != null && resumeMovie != null && showRecommendations && panels.active != HomePanel.SEARCH) {
                     Spacer(Modifier.height(Theme.Space.Page))
                     PlaybackHistoryGlassContainer(
@@ -125,6 +125,21 @@ internal fun HomeScreen(
                         if (state.query.isNotBlank()) "${state.movies.size} 部" else null,
                         Modifier.weight(Theme.Size.Weight),
                     )
+                    if (state.canReplaceRecommendations) {
+                        Box(
+                            Modifier.heightIn(min = Theme.Size.Touch)
+                                .hapticClickable(enabled = !state.loading, onClick = state::replaceRecommendations)
+                                .padding(horizontal = Theme.Space.XSmall),
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            AppText(
+                                if (state.loading && state.replacingRecommendations) "加载中" else "换一批",
+                                style = Theme.Type.Label,
+                                color = if (state.loading) Theme.Colors.Muted else Theme.Colors.Accent,
+                                maxLines = Theme.Size.SingleLine,
+                            )
+                        }
+                    }
                     CompositionLocalProvider(LocalGlassTuning provides panelGlass) {
                     if (tvBox != null) AmbientGlassSurface(
                         Modifier.capsuleAnchor(panels, HomePanel.FAVORITES),

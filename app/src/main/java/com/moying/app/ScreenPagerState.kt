@@ -10,7 +10,6 @@ import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlin.math.abs
-import kotlin.math.roundToInt
 
 /** 底栏与三页只共用这一份连续位置；不把离屏预览当成正在播放的页面。 */
 @Stable
@@ -60,7 +59,9 @@ internal class ScreenPagerState(val pager: PagerState, private val scope: Corout
 
     /** 输入：松手目标与速度（页/秒）；输出：连续位置弹性吸附，快速切换取消旧任务。 */
     fun finishDrag(target: Int, velocity: Float) = settleTo(target, velocity)
-    fun cancelDrag() = settleTo(position.value.roundToInt(), Theme.Size.EmptyFraction)
+    fun cancelDrag() {
+        if (navDragging) navigateTo(committedPage)
+    }
     fun navigateTo(page: Int) = settleTo(page, Theme.Size.EmptyFraction)
 
     private fun settleTo(page: Int, velocity: Float) {

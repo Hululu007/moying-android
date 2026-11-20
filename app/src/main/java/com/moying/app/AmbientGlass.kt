@@ -76,7 +76,12 @@ fun AmbientBackdropHost(
         if (backdrop.bounds.size != bounds.size) backdrop.ready = false
         backdrop.bounds = bounds
     } else Modifier
-    Box(modifier.then(placement).drawWithContent {
+    // Keep the shared background display list independent from the scrolling page.
+    // The default graphics layer isolates drawing without allocating an offscreen buffer.
+    val isolation = if (trackPosition && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        Modifier.graphicsLayer()
+    } else Modifier
+    Box(modifier.then(placement).then(isolation).drawWithContent {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             backdrop.layer.record { this@drawWithContent.drawContent() }
             if (!backdrop.ready) backdrop.ready = true

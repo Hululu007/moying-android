@@ -31,6 +31,7 @@ import java.util.concurrent.atomic.AtomicInteger
 /** Debug-only real GPU scene; no timers, networking or app preferences. */
 class DebugGlassActivity : ComponentActivity() {
     val windowDraws = AtomicInteger()
+    val wallpaperDraws = AtomicInteger()
     val sceneReady = CountDownLatch(1)
     @Volatile var navigationBounds = Rect.Zero
         private set
@@ -38,6 +39,8 @@ class DebugGlassActivity : ComponentActivity() {
     var moved by mutableStateOf(false)
     var page by mutableStateOf("first")
     var glassEnabled by mutableStateOf(true)
+    var showWallpaper by mutableStateOf(false)
+    var wallpaperGreen by mutableStateOf(false)
     internal var scrollCard by mutableStateOf(false)
     internal var previewStyle by mutableStateOf(CatalogGlassStyle.SCROLL)
     internal var refractPreviewContent by mutableStateOf(false)
@@ -58,13 +61,19 @@ class DebugGlassActivity : ComponentActivity() {
                 ScrollCardScene()
                 return@setContent
             }
-            val backdrop = rememberPageBackdrop(enabled = glassEnabled, page = page)
-            CompositionLocalProvider(LocalPageBackdrop provides backdrop, LocalAmbientBackdrop provides null) {
+            val backdrop = rememberPageBackdrop(enabled = glassEnabled, page = page, shareRenderedPage = true)
+            val wallpaper = rememberAmbientBackdrop()
+            CompositionLocalProvider(LocalPageBackdrop provides backdrop, LocalAmbientBackdrop provides wallpaper) {
                 Box(Modifier.fillMaxSize().background(Color.Black)) {
                     PageBackdropHost(backdrop, Modifier.fillMaxSize()) {
+                        AmbientBackdropHost(wallpaper, Modifier.fillMaxSize()) {
+                            Canvas(Modifier.fillMaxSize()) {
+                                wallpaperDraws.incrementAndGet()
+                                drawRect(if (wallpaperGreen) Color(0xFF22D044) else Color(0xFFDA2222))
+                            }
+                        }
                         Canvas(Modifier.fillMaxSize()) {
-                            val pageColor = if (green) Color(0xFF22D044) else Color(0xFFDA2222)
-                            drawRect(pageColor)
+                            if (!showWallpaper) drawRect(if (green) Color(0xFF22D044) else Color(0xFFDA2222))
                             drawRect(Color(0xFF285EE8), Offset(size.width / 2f, 0f), Size(size.width / 2f, size.height))
                         }
                     }

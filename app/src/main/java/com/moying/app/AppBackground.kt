@@ -29,10 +29,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.IntSize
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.InputStream
 import kotlin.math.max
 import kotlin.math.sqrt
+
+// A native bitmap decode may finish after its Compose request is cancelled.
+private val backgroundDecodeLock = Mutex()
 
 /** 绘制当前窗口的环境背景，供玻璃卡片取样。 */
 @Composable
@@ -49,12 +54,16 @@ fun AppBackground(
     val wallpaper = builtInWallpaper.takeIf { style == AppBackgroundStyle.BUILT_IN }
     var image by remember(source, wallpaper) { mutableStateOf<BackgroundImage?>(null) }
     LaunchedEffect(source, wallpaper, target) {
-        image = when {
-            target.width <= 0 || target.height <= 0 -> null
-            wallpaper != null -> loadBackground(target, readOrientation = false) { context.assets.open(wallpaper.asset) }
-            source.isNotBlank() -> loadBackground(target) { context.contentResolver.openInputStream(Uri.parse(source)) }
-            else -> null
-        }
+        val size = target
+        image = if (size.width > 0 && size.height > 0 && (wallpaper != null || source.isNotBlank())) {
+            backgroundDecodeLock.withLock {
+                if (wallpaper != null) {
+                    loadBackground(size, readOrientation = false) { context.assets.open(wallpaper.asset) }
+                } else {
+                    loadBackground(size) { context.contentResolver.openInputStream(Uri.parse(source)) }
+                }
+            }
+        } else null
     }
     val base = when (style) {
         AppBackgroundStyle.BLUE -> Theme.Background.BlueBase
@@ -152,7 +161,9 @@ private suspend fun loadBackground(
     readOrientation: Boolean = true,
     openImage: () -> InputStream?,
 ): BackgroundImage? = withContext(Dispatchers.IO) {
+    var unpublishedBitmap: Bitmap? = null
     try {
+        ensureActive()
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         val boundsStream = openImage() ?: return@withContext null
         boundsStream.use { BitmapFactory.decodeStream(it, null, bounds) }
@@ -164,11 +175,13 @@ private suspend fun loadBackground(
         ensureActive()
         val options = BitmapFactory.Options().apply { inSampleSize = sample; inPreferredConfig = Bitmap.Config.ARGB_8888 }
         var decoded = openImage()?.use { BitmapFactory.decodeStream(it, null, options) } ?: return@withContext null
+        unpublishedBitmap = decoded
         ensureActive()
         val orientation = if (readOrientation) openImage()?.use { stream ->
             runCatching { ExifInterface(stream).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL) }
                 .getOrDefault(ExifInterface.ORIENTATION_NORMAL)
         } ?: ExifInterface.ORIENTATION_NORMAL else ExifInterface.ORIENTATION_NORMAL
+        ensureActive()
         val rotation = Matrix().apply {
             when (orientation) {
                 ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> setScale(-1f, 1f)
@@ -182,23 +195,34 @@ private suspend fun loadBackground(
         }
         if (!rotation.isIdentity) {
             val oriented = Bitmap.createBitmap(decoded, 0, 0, decoded.width, decoded.height, rotation, true)
-            if (oriented !== decoded) decoded.recycle()
+            if (oriented !== decoded) {
+                unpublishedBitmap = oriented
+                decoded.recycle()
+            }
             decoded = oriented
         }
+        ensureActive()
         val ratio = minOf(1f, targetEdge.toFloat() / max(decoded.width, decoded.height),
             sqrt(Theme.Background.ImageMaxPixels.toDouble() / (decoded.width.toLong() * decoded.height)).toFloat())
         val result = if (ratio < 1f) Bitmap.createScaledBitmap(decoded,
             (decoded.width * ratio).toInt().coerceAtLeast(1),
             (decoded.height * ratio).toInt().coerceAtLeast(1), true) else decoded
-        if (result !== decoded) decoded.recycle()
+        if (result !== decoded) {
+            unpublishedBitmap = result
+            decoded.recycle()
+        }
         ensureActive()
-        BackgroundImage(result.asImageBitmap(), sampleBackgroundBrightness(result, target))
+        val brightness = sampleBackgroundBrightness(result, target)
+        ensureActive()
+        BackgroundImage(result.asImageBitmap(), brightness).also { unpublishedBitmap = null }
     } catch (cancelled: kotlinx.coroutines.CancellationException) {
         throw cancelled
     } catch (_: Exception) {
         null
     } catch (_: OutOfMemoryError) {
         null
+    } finally {
+        unpublishedBitmap?.recycle()
     }
 }
 

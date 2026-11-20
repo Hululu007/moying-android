@@ -71,6 +71,7 @@ object GlassIdleRegression {
             val red = sample(host)
             assertThat(red[0] > red[1] + 25 && red[0] > red[2] + 25, "Initial glass did not sample red page: ${red.toList()}")
 
+            val wallpaperDraws = host.wallpaperDraws.get()
             // This value is read only by Canvas.draw, so the colour change must
             // propagate through its live RenderNode dependency without forcing
             // recomposition of the navigation or changing the page key.
@@ -79,6 +80,8 @@ object GlassIdleRegression {
             val green = sample(host)
             assertThat(green[1] > green[0] + 25 && green[1] > green[2] + 25,
                 "Content/page update left old glass pixels: ${green.toList()}")
+            assertThat(wallpaperDraws > 0 && host.wallpaperDraws.get() == wallpaperDraws,
+                "Updating the page rerecorded the wallpaper: $wallpaperDraws -> ${host.wallpaperDraws.get()}")
             assertIdle(host)
 
             main { host.page = "second"; host.green = false }
@@ -109,6 +112,17 @@ object GlassIdleRegression {
             val glassRestored = sample(host)
             assertThat(glassRestored[0] > glassRestored[2] + 25,
                 "Turning glass back on did not sample the current page: ${glassRestored.toList()}")
+            assertIdle(host)
+            main { host.showWallpaper = true }
+            Thread.sleep(250)
+            val oldWallpaper = sample(host)
+            assertThat(oldWallpaper[0] > oldWallpaper[1] + 25,
+                "Navigation did not sample the visible wallpaper: ${oldWallpaper.toList()}")
+            main { host.wallpaperGreen = true }
+            Thread.sleep(250)
+            val newWallpaper = sample(host)
+            assertThat(newWallpaper[1] > newWallpaper[0] + 25 && newWallpaper[1] > newWallpaper[2] + 25,
+                "Updating the wallpaper left old glass pixels: ${newWallpaper.toList()}")
             assertIdle(host)
             main {
                 host.scrollTuning.value = host.scrollTuning.value.copy(refraction = 0f)
@@ -166,6 +180,7 @@ object GlassIdleRegression {
                 putString("blueSample", blue.toList().toString())
                 putString("glassOffSample", glassOff.toList().toString())
                 putString("glassRestoredSample", glassRestored.toList().toString())
+                putString("updatedWallpaperSample", newWallpaper.toList().toString())
                 putString("flatScrollSample", flatCard.toList().toString())
                 putString("refractedScrollSample", refractedCard.toList().toString())
                 putString("scrollBackgroundSample", cardBackground.toList().toString())

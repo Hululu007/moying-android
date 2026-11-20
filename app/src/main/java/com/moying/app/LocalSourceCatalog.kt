@@ -74,7 +74,7 @@ private fun localCatalogFacets(movies: Collection<Movie>): List<CatalogFacet> = 
     if (sorts.size > 1) add(CatalogFacet(LocalSort, "排序", sorts))
 }
 
-private fun metadataValues(text: String): List<String> {
+internal fun metadataValues(text: String): List<String> {
     if (text.trim().lowercase() in missingMetadata) return emptyList()
     return text.split(metadataSeparators).map { it.trim() }.filter {
         it.isNotEmpty() && it.lowercase() !in missingMetadata
