@@ -109,20 +109,30 @@ class SourceDeletionInstrumentation : Instrumentation() {
                 assertThat(repository.sourceRevision == revision, "rejected deletions leave revision unchanged")
             }
 
-            testCase("last network source falls back to local across restart") { isolated ->
+            testCase("clearing all network sources preserves local and allows reimport across restart") { isolated ->
                 val repository = TvBoxMovieRepository(isolated)
+                val builtIn = repository.sources.first { it.id != "local" }
                 val imported = importSite(repository, "Last test source", "https://last-source-test.invalid/api")
+                val direct = checkNotNull(repository.addSource("Direct fixture", "https://direct-test.invalid/video.mp4"))
                 repository.selectSource(imported.id)
-                repository.sources.filter { it.id != "local" }.toList().forEach { source ->
-                    assertThat(repository.deleteSource(source.id), "delete ${source.id}")
-                }
+                val networkCount = repository.sources.count { it.id != "local" }
+                val revision = repository.sourceRevision
+                assertThat(repository.clearNetworkSources() == networkCount, "bulk clear removes built-in and imported sources")
                 assertThat(repository.sources.map { it.id } == listOf("local"), "local remains after removing all network sources")
-                assertThat(repository.selectedSourceId == "local", "last deletion selects local")
-                assertThat(repository.getMovies(0, repository.categories.first()).items.isNotEmpty(), "local catalog remains usable")
+                assertThat(repository.selectedSourceId == "local", "bulk clear selects local")
+                assertThat(repository.sourceRevision == revision + 1, "bulk clear refreshes the catalog once")
+                assertThat(repository.clearNetworkSources() == 0 && repository.sourceRevision == revision + 1,
+                    "clearing again is a no-op")
+                assertThat(repository.getMovies(0, repository.categories.first(), direct.title).items.single() == direct,
+                    "direct media remains browsable in the local catalog")
 
                 val restarted = TvBoxMovieRepository(isolated)
                 assertThat(restarted.sources.map { it.id } == listOf("local"), "deleted sources do not return on restart")
                 assertThat(restarted.selectedSourceId == "local", "local fallback is persisted")
+                assertThat(restarted.getMovie(direct.id) == direct, "direct media survives restart")
+                val restored = importSite(restarted, "Restored built-in", builtIn.api)
+                assertThat(TvBoxMovieRepository(isolated).sources.map { it.id } == listOf(restored.id, "local"),
+                    "reimport restores only the requested site across restart")
             }
 
             testCase("reimported built-in has one stable identity after restart") { isolated ->
@@ -226,7 +236,7 @@ class SourceDeletionInstrumentation : Instrumentation() {
                             repository.getMovies(0, repository.categories.first())
                         }
                         assertThat(fixture.firstRequestReceived.await(5, TimeUnit.SECONDS), "old request is waiting before its response")
-                        assertThat(repository.deleteSource(original.id), "delete source with a request in flight")
+                        assertThat(repository.clearNetworkSources() > 0, "clear sources with a request in flight")
                         val replacement = importSite(repository, "New request source", fixture.api)
                         assertThat(replacement.id == original.id, "same URL reuses ID, so object identity must guard stale writes")
                         repository.selectSource(replacement.id)

@@ -263,13 +263,28 @@ class HomeState internal constructor(
         if (!repository.deleteSource(id)) return false
         sourceChecks.remove(id)
         pendingSourceChecks.remove(id)
+        refreshAfterSourceDeletion(repository)
+        importMessage = "已删除「${source.name}」"
+        return true
+    }
+
+    fun clearNetworkSources(repository: TvBoxMovieRepository): Boolean {
+        if (importBusy || sourceCheckRunning) return false
+        val removed = repository.clearNetworkSources()
+        if (removed == 0) return false
+        sourceChecks.clear()
+        pendingSourceChecks.clear()
+        refreshAfterSourceDeletion(repository)
+        importMessage = "已清空 $removed 个网络片源"
+        return true
+    }
+
+    private fun refreshAfterSourceDeletion(repository: TvBoxMovieRepository) {
         sourceCheckCompleted = 0
         sourceCheckTotal = 0
         sourceCheckAvailable = 0
         sourceCheckStopped = false
         sourceChanged(repository.sourceRevision, repository.selectedSourceId)
-        importMessage = "已删除「${source.name}」"
-        return true
     }
 
     /** scope 在 Main 中创建；收起面板或进入播放器不会留下半途取消的导入。 */

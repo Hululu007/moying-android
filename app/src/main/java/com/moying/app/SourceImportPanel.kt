@@ -36,8 +36,10 @@ fun SourceImportPanel(repository: MovieRepository, state: HomeState, appearance:
     val tvBox = repository as? TvBoxMovieRepository
     val availabilityRepository = repository as? SourceAvailabilityRepository
     val importEnabled = !state.importBusy && !state.sourceCheckRunning
+    val networkSourceCount = tvBox?.sources?.count { it.id != "local" } ?: 0
     var managingSources by rememberSaveable { mutableStateOf(false) }
     var pendingDeleteId by rememberSaveable { mutableStateOf<String?>(null) }
+    var confirmClearSources by rememberSaveable { mutableStateOf(false) }
     val context = LocalContext.current.applicationContext
     val pickDocument = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null && tvBox != null) state.importSources {
@@ -87,8 +89,9 @@ fun SourceImportPanel(repository: MovieRepository, state: HomeState, appearance:
                         }
                     }
                 }
-                if (managingSources) {
-                    AppText("点击右侧删除按钮移除片源；本地 / 直链入口保留。", style = Theme.Type.Caption, color = Theme.Colors.Muted)
+                if (managingSources && networkSourceCount > 0) {
+                    ActionButton("清空全部片源", { confirmClearSources = true }, Modifier.fillMaxWidth(),
+                        primary = false, enabled = importEnabled)
                 }
                 if (availabilityRepository != null) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Theme.Space.Small)) {
@@ -164,22 +167,34 @@ fun SourceImportPanel(repository: MovieRepository, state: HomeState, appearance:
                 }
             }, Modifier.fillMaxWidth(), enabled = importEnabled && state.sourceUrl.isNotBlank())
         }
-    tvBox?.sources?.firstOrNull { it.id == pendingDeleteId && it.id != "local" }?.let { source ->
-        Dialog(onDismissRequest = { pendingDeleteId = null }) {
+    val source = tvBox?.sources?.firstOrNull { it.id == pendingDeleteId && it.id != "local" }
+    if (tvBox != null && (source != null || (confirmClearSources && networkSourceCount > 0))) {
+        val dismissDelete = {
+            pendingDeleteId = null
+            confirmClearSources = false
+        }
+        Dialog(onDismissRequest = dismissDelete) {
             // Dialog 与页面不在同一个布局根，不能采样页面的实时玻璃坐标。
             Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(Theme.Radius.Card)).background(Theme.Colors.Surface)
                 .border(Theme.Space.Hairline, Theme.Colors.Border, RoundedCornerShape(Theme.Radius.Card))) {
                 Column(Modifier.padding(Theme.Space.Page), verticalArrangement = Arrangement.spacedBy(Theme.Space.Large)) {
-                    AppText("删除片源？", style = Theme.Type.Section)
-                    AppText("确定删除「${source.name}」？观看历史和已添加的直链会保留，需要时可重新导入。", style = Theme.Type.Body, color = Theme.Colors.Secondary)
-                    if (tvBox.selectedSourceId == source.id) {
-                        val fallback = tvBox.sources.first { it.id != source.id }
-                        AppText("删除后将切换到「${fallback.name}」。", style = Theme.Type.Caption, color = Theme.Colors.Secondary)
+                    if (source == null) {
+                        AppText("清空全部网络片源？", style = Theme.Type.Section)
+                        AppText("将删除 $networkSourceCount 个网络片源，包括内置和已导入片源，随后切换到「本地 / 直链」。已添加的直链、观看历史、收藏和离线缓存会保留。需要时可重新导入片源。",
+                            style = Theme.Type.Body, color = Theme.Colors.Secondary)
+                    } else {
+                        AppText("删除片源？", style = Theme.Type.Section)
+                        AppText("确定删除「${source.name}」？观看历史和已添加的直链会保留，需要时可重新导入。", style = Theme.Type.Body, color = Theme.Colors.Secondary)
+                        if (tvBox.selectedSourceId == source.id) {
+                            val fallback = tvBox.sources.first { it.id != source.id }
+                            AppText("删除后将切换到「${fallback.name}」。", style = Theme.Type.Caption, color = Theme.Colors.Secondary)
+                        }
                     }
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(Theme.Space.Small)) {
-                        ActionButton("取消", { pendingDeleteId = null }, Modifier.weight(Theme.Size.Weight), primary = false)
-                        ActionButton("确认删除", {
-                            if (state.deleteSource(tvBox, source.id)) pendingDeleteId = null
+                        ActionButton("取消", dismissDelete, Modifier.weight(Theme.Size.Weight), primary = false)
+                        ActionButton(if (source == null) "确认清空" else "确认删除", {
+                            val deleted = if (source == null) state.clearNetworkSources(tvBox) else state.deleteSource(tvBox, source.id)
+                            if (deleted) dismissDelete()
                         }, Modifier.weight(Theme.Size.Weight), enabled = importEnabled)
                     }
                 }

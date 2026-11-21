@@ -13,12 +13,19 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
 import java.net.URL
 import java.nio.ByteBuffer
 import java.security.GeneralSecurityException
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicLong
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
@@ -236,10 +243,7 @@ internal class IntroAudioExtractor(context: Context) {
             val lines = text.lineSequence().map(String::trim).filter(String::isNotEmpty).toList()
             val variant = chooseVariant(url, lines)
             if (variant == null) {
-                val prefix = mediaPrefix(url, lines)
-                file.outputStream().use { output ->
-                    prefix.forEach { resource -> network.download(resource, output) }
-                }
+                downloadResources(mediaPrefix(url, lines), file, network, budget)
                 return
             }
             val next = network.playlist(variant)
@@ -247,6 +251,91 @@ internal class IntroAudioExtractor(context: Context) {
             text = next.second
         }
         throw IntroAudioScanException("HLS 播放列表层级过多，无法识别片头。")
+    }
+
+    private fun downloadResources(
+        resources: List<Resource>,
+        file: File,
+        network: ScanNetwork,
+        budget: IntroAudioScanBudget,
+    ) {
+        if (resources.size == 1) {
+            file.outputStream().use { network.download(resources.single(), it) }
+            return
+        }
+        // Keep a small window in flight and append finished parts in playlist order.
+        // Each retry rewinds its own part, including encrypted and byte-range resources.
+        val directory = File(file.parentFile, "${file.name}.parts")
+        if (!directory.mkdir()) throw IOException("Could not create HLS scan directory")
+        val workers = Executors.newFixedThreadPool(minOf(HlsDownloadWorkers, resources.size))
+        val pending = ArrayDeque<Pair<File, Future<*>>>()
+        var next = 0
+        var stopped = false
+        fun enqueue() {
+            budget.check()
+            val resource = resources[next]
+            val part = File(directory, (next++).toString())
+            pending.addLast(part to workers.submit {
+                try {
+                    val output = synchronized(directory) {
+                        if (stopped) throw CancellationException("已取消片头识别")
+                        part.outputStream()
+                    }
+                    output.use { network.download(resource, it) }
+                } finally {
+                    synchronized(directory) {
+                        if (stopped) {
+                            part.delete()
+                            directory.delete()
+                        }
+                    }
+                }
+            })
+        }
+        try {
+            file.outputStream().use { output ->
+                val buffer = ByteArray(16 * 1024)
+                repeat(minOf(HlsDownloadWorkers, resources.size)) { enqueue() }
+                while (pending.isNotEmpty()) {
+                    val (part, future) = pending.first()
+                    awaitPart(future, budget)
+                    part.inputStream().use { input ->
+                        while (true) {
+                            budget.check()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                    part.delete()
+                    pending.removeFirst()
+                    if (next < resources.size) enqueue()
+                }
+            }
+        } finally {
+            // On Android an open file can be unlinked. Prevent any worker from reopening
+            // its part after cleanup, and interrupt unneeded requests before deleting it.
+            synchronized(directory) { stopped = true }
+            pending.forEach { (_, future) -> future.cancel(true) }
+            workers.shutdownNow()
+            directory.deleteRecursively()
+        }
+    }
+
+    private fun awaitPart(future: Future<*>, budget: IntroAudioScanBudget) {
+        while (true) {
+            try {
+                future.get(budget.timeoutMillis(200).toLong(), TimeUnit.MILLISECONDS)
+                return
+            } catch (_: TimeoutException) {
+                // Check cancellation and the shared deadline again, even during a stalled response.
+            } catch (error: ExecutionException) {
+                throw error.cause ?: error
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw CancellationException("已取消片头识别")
+            }
+        }
     }
 
     private data class KeyTag(val declaration: Int, val attributes: Map<String, String>)
@@ -372,8 +461,8 @@ internal class IntroAudioExtractor(context: Context) {
     private fun resolve(base: String, relative: String): String = URL(URL(base), relative).toString()
 
     private class ScanNetwork(private val budget: IntroAudioScanBudget) {
-        private var episodeBytes = 0L
-        private val keys = mutableMapOf<Int, ByteArray>()
+        private val episodeBytes = AtomicLong()
+        private val keys = ConcurrentHashMap<Int, ByteArray>()
 
         data class Probe(val url: String, val playlist: String?, val totalBytes: Long?, val incompletePlaylist: Boolean = false)
         private data class ResponseRange(val start: Long, val end: Long, val total: Long?)
@@ -390,9 +479,8 @@ internal class IntroAudioExtractor(context: Context) {
                 if (length > remaining()) throw scanSizeLimit()
                 while (prefix.size() < length) {
                     budget.check()
-                    val size = input.read(buffer, 0, length - prefix.size())
+                    val size = readBytes(input, buffer, 0, length - prefix.size())
                     if (size < 0) break
-                    account(size)
                     prefix.write(buffer, 0, size)
                 }
                 if (partial && prefix.size() != length) throw IntroAudioScanException("片源返回的数据不完整。")
@@ -421,7 +509,7 @@ internal class IntroAudioExtractor(context: Context) {
 
         fun download(resource: Resource, output: FileOutputStream) {
             val decryption = resource.encryption?.let { encryption ->
-                val key = keys.getOrPut(encryption.declaration) { downloadKey(encryption.keyUrl) }
+                val key = keys.computeIfAbsent(encryption.declaration) { downloadKey(encryption.keyUrl) }
                 val iv = ByteArray(16) { index -> encryption.ivHex.substring(index * 2, index * 2 + 2).toInt(16).toByte() }
                 key to iv
             }
@@ -459,9 +547,8 @@ internal class IntroAudioExtractor(context: Context) {
                         var received = 0
                         while (received < limit) {
                             budget.check()
-                            val size = input.read(bytes, received, limit - received)
+                            val size = readBytes(input, bytes, received, limit - received)
                             if (size < 0) break
-                            account(size)
                             received += size
                         }
                         received
@@ -519,7 +606,6 @@ internal class IntroAudioExtractor(context: Context) {
                     connection.useCaches = false
                     connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Android) Moying/1.4")
                     connection.setRequestProperty("Accept-Encoding", "identity")
-                    connection.setRequestProperty("Connection", "close")
                     range?.let { connection.setRequestProperty("Range", "bytes=${it.first}-${it.last}") }
                     val status = connection.responseCode
                     if (status in listOf(301, 302, 303, 307, 308)) {
@@ -550,7 +636,7 @@ internal class IntroAudioExtractor(context: Context) {
             return ResponseRange(start, end, total)
         }
 
-        private fun copy(input: java.io.InputStream, output: OutputStream, limit: Int, expected: Long?, cipher: Cipher? = null) {
+        private fun copy(input: InputStream, output: OutputStream, limit: Int, expected: Long?, cipher: Cipher? = null) {
             val allowed = minOf(limit.toLong(), remaining())
             if (expected != null && expected > allowed) throw scanSizeLimit()
             val effectiveLimit = expected ?: allowed
@@ -558,9 +644,8 @@ internal class IntroAudioExtractor(context: Context) {
             var written = 0L
             while (written < effectiveLimit) {
                 budget.check()
-                val size = input.read(data, 0, minOf(data.size.toLong(), effectiveLimit - written).toInt())
+                val size = readBytes(input, data, 0, minOf(data.size.toLong(), effectiveLimit - written).toInt())
                 if (size < 0) break
-                account(size)
                 if (cipher == null) output.write(data, 0, size)
                 else cipher.update(data, 0, size)?.let(output::write)
                 written += size
@@ -578,12 +663,19 @@ internal class IntroAudioExtractor(context: Context) {
 
         private fun invalidEncryptedSegment() = IntroAudioScanException("HLS 分片无法用片源提供的 AES-128 密钥解密。")
 
-        private fun remaining(): Long = minOf(EpisodeByteLimit - episodeBytes, budget.remainingBytes()).coerceAtLeast(0L)
+        private fun remaining(): Long = minOf(EpisodeByteLimit - episodeBytes.get(), budget.remainingBytes()).coerceAtLeast(0L)
 
-        private fun account(size: Int) {
-            episodeBytes += size
-            budget.addBytes(size)
-            if (episodeBytes > EpisodeByteLimit) throw scanSizeLimit()
+        private fun readBytes(input: InputStream, buffer: ByteArray, offset: Int, length: Int): Int {
+            // A concurrent stream can consume the remaining allowance while this read is
+            // in flight. Recheck after reading, before passing any excess data to the caller.
+            val allowed = minOf(length.toLong(), remaining()).toInt()
+            if (allowed == 0) throw scanSizeLimit()
+            val size = input.read(buffer, offset, allowed)
+            if (size > 0) {
+                budget.addBytes(size)
+                if (episodeBytes.addAndGet(size.toLong()) > EpisodeByteLimit) throw scanSizeLimit()
+            }
+            return size
         }
     }
 
@@ -633,6 +725,7 @@ internal class IntroAudioExtractor(context: Context) {
     private companion object {
         const val ScanDurationUs = 180_000_000L
         const val SegmentLimit = 120
+        const val HlsDownloadWorkers = 4
         const val ManifestBytes = 512 * 1024
         const val ProbeBytes = 4 * 1024
         const val SegmentBytes = 12 * 1024 * 1024

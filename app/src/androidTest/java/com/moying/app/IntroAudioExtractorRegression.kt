@@ -2,6 +2,7 @@ package com.moying.app
 
 import android.content.Context
 import android.os.Bundle
+import android.os.SystemClock
 import kotlinx.coroutines.CancellationException
 import java.util.zip.CRC32
 import kotlin.math.abs
@@ -74,6 +75,26 @@ internal object IntroAudioExtractorRegression {
         }
         verify("AES-128 HLS partial body timeout retry", "aes128/rotating/episode-1/index.m3u8") {
             if (it == 1) "aes-drop/episode-1/index.m3u8" else "aes128/rotating/episode-$it/index.m3u8"
+        }
+        if (args.getString("introDelayedFixture") == "true") {
+            val started = SystemClock.elapsedRealtime()
+            verify("many delayed HLS segments", "hls/episode-1/index.m3u8") {
+                val route = if (it <= 2) "many-delays" else "hls"
+                "$route/episode-$it/index.m3u8"
+            }
+            result.putLong("many delayed HLS segments elapsed milliseconds", SystemClock.elapsedRealtime() - started)
+
+            fun introTemporaryFiles() = context.cacheDir.listFiles()
+                .orEmpty().filter { it.name.startsWith("intro-audio-") }.toSet()
+            val filesBefore = introTemporaryFiles()
+            val cancelStarted = SystemClock.elapsedRealtime()
+            val cancelBudget = IntroAudioScanBudget { SystemClock.elapsedRealtime() - cancelStarted >= 1_200L }
+            val cancelled = runCatching { read("many-delays/episode-1/index.m3u8", cancelBudget) }.exceptionOrNull()
+            check(cancelled is CancellationException) { "Expected in-flight cancellation, got $cancelled" }
+            val cancelElapsed = SystemClock.elapsedRealtime() - cancelStarted
+            check(cancelElapsed < 3_500L) { "Took ${cancelElapsed} ms to cancel delayed downloads" }
+            check(introTemporaryFiles() == filesBefore) { "Cancelled HLS download left temporary files" }
+            result.putLong("in-flight HLS cancellation elapsed milliseconds", cancelElapsed)
         }
 
         fun verifyRejected(path: String, reason: String) {

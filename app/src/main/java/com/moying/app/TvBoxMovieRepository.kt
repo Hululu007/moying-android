@@ -157,24 +157,34 @@ class TvBoxMovieRepository(context: Context) : MovieRepository, SourceAvailabili
 
     /** 删除站点配置并记住内置站的删除状态；历史和播放地址独立保留。 */
     @Synchronized
-    fun deleteSource(id: String): Boolean {
-        val source = sources.firstOrNull { it.id == id && it.id != "local" } ?: return false
-        val remaining = sources.filterNot { it.id == id }
-        val selected = if (selectedSourceId == id) remaining.first().id else selectedSourceId
-        deletedSourceKeys += SourceImport.sourceKey(source.api)
+    fun deleteSource(id: String): Boolean = removeNetworkSources { it.id == id } > 0
+
+    @Synchronized
+    fun clearNetworkSources(): Int = removeNetworkSources { true }
+
+    private fun removeNetworkSources(matches: (TvBoxSource) -> Boolean): Int {
+        val (removed, remaining) = sources.partition { it.id != "local" && matches(it) }
+        if (removed.isEmpty()) return 0
+
+        val removedIds = removed.mapTo(hashSetOf()) { it.id }
+        val selected = if (selectedSourceId in removedIds) remaining.first().id else selectedSourceId
+        deletedSourceKeys += removed.map { SourceImport.sourceKey(it.api) }
         persistSources(remaining, selected)
-        pages.keys.removeAll { it.startsWith("$id|") }
-        playlists.remove(id)
-        types.remove(id)
-        cmsCatalogs.remove(id)
-        observedCatalogs.remove(id)
-        catalogPages.keys.removeAll { it.sourceId == id }
+        val prefixes = removedIds.map { "$it|" }
+        pages.keys.removeAll { key -> prefixes.any { key.startsWith(it) } }
+        catalogPages.keys.removeAll { it.sourceId in removedIds }
+        removedIds.forEach { id ->
+            playlists.remove(id)
+            types.remove(id)
+            cmsCatalogs.remove(id)
+            observedCatalogs.remove(id)
+        }
         Snapshot.withMutableSnapshot {
             sourceState.value = remaining
             selectedState.value = selected
             revisionState.intValue++
         }
-        return true
+        return removed.size
     }
 
     private fun persistSources(updated: List<TvBoxSource>, selected: String) {
