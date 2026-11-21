@@ -51,6 +51,9 @@ internal object IntroAudioExtractorRegression {
         verify("progressive MP4") { "episode-$it.mp4" }
         verify("MPEG-TS HLS") { "hls/episode-$it/index.m3u8" }
         verify("fragmented MP4 HLS") { "hls-fmp4/episode-$it/index.m3u8" }
+        verify("AES-128 MPEG-TS HLS") { "aes128/basic/episode-$it/index.m3u8" }
+        verify("rotating AES-128 MPEG-TS HLS") { "aes128/rotating/episode-$it/index.m3u8" }
+        verify("AES-128 fragmented MP4 HLS") { "aes128/fmp4/episode-$it/index.m3u8" }
 
         fun verifyRejected(path: String, reason: String) {
             val failure = runCatching { read(path, IntroAudioScanBudget()) }.exceptionOrNull()
@@ -60,9 +63,12 @@ internal object IntroAudioExtractorRegression {
         }
 
         verifyRejected("negative/live.m3u8", "直播")
-        verifyRejected("negative/encrypted.m3u8", "已加密")
+        verifyRejected("negative/missing-key.m3u8", "无法读取 HLS 解密密钥")
+        verifyRejected("negative/invalid-key.m3u8", "无效的 HLS AES-128 密钥")
+        verifyRejected("negative/sample-aes.m3u8", "暂不支持的加密方式")
+        verifyRejected("negative/drm.m3u8", "暂不支持的加密方式")
         check(runCatching { read("episode-1.mp4", IntroAudioScanBudget { true }) }.exceptionOrNull() is CancellationException)
-        result.putString("rejections", "live HLS, encrypted HLS, cancelled scan")
+        result.putString("rejections", "live HLS, missing and invalid AES-128 keys, SAMPLE-AES, DRM, cancelled scan")
         check(failures.isEmpty()) { "${failures.joinToString("\n")}\nCompleted results: $result" }
         return result
     }

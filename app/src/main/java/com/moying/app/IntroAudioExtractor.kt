@@ -17,7 +17,11 @@ import java.net.HttpURLConnection
 import java.net.SocketTimeoutException
 import java.net.URL
 import java.nio.ByteBuffer
+import java.security.GeneralSecurityException
 import java.util.concurrent.atomic.AtomicLong
+import javax.crypto.Cipher
+import javax.crypto.spec.IvParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 internal class IntroAudioScanException(message: String) : IOException(message)
 
@@ -241,7 +245,9 @@ internal class IntroAudioExtractor(context: Context) {
         throw IntroAudioScanException("HLS 播放列表层级过多，无法识别片头。")
     }
 
-    private data class Resource(val url: String, val range: LongRange? = null)
+    private data class KeyTag(val declaration: Int, val attributes: Map<String, String>)
+    private data class Encryption(val declaration: Int, val keyUrl: String, val ivHex: String)
+    private data class Resource(val url: String, val range: LongRange? = null, val encryption: Encryption? = null)
     private data class Variant(val url: String, val audioGroup: String?, val bandwidth: Long)
 
     private fun chooseVariant(base: String, lines: List<String>): String? {
@@ -262,22 +268,34 @@ internal class IntroAudioExtractor(context: Context) {
 
     private fun mediaPrefix(base: String, lines: List<String>): List<Resource> {
         if ("#EXT-X-ENDLIST" !in lines) throw IntroAudioScanException("直播或未完结的 HLS 列表暂不支持片头识别。")
+        if ("#EXT-X-I-FRAMES-ONLY" in lines) throw IntroAudioScanException("仅含关键帧的 HLS 列表暂不支持片头识别。")
         val prefix = mutableListOf<Resource>()
+        val keys = mutableMapOf<String, KeyTag>()
         var init: Resource? = null
         var elapsedUs = 0L
         var segmentDurationUs = 0L
         var segmentCount = 0
+        var mediaSequence = 0UL
         var pendingRange: String? = null
         var previous: Resource? = null
-        for (line in lines) {
+        for ((lineIndex, line) in lines.withIndex()) {
             when {
-                line.startsWith("#EXT-X-KEY:") && attributes(line)["METHOD"] != "NONE" -> {
-                    throw IntroAudioScanException("这条 HLS 线路已加密，无法识别片头。")
+                line.startsWith("#EXT-X-KEY:") -> {
+                    val attrs = attributes(line)
+                    when (attrs["METHOD"]) {
+                        "NONE" -> keys.clear()
+                        null -> throw invalidPlaylist()
+                        else -> keys[attrs["KEYFORMAT"] ?: "identity"] = KeyTag(lineIndex, attrs)
+                    }
+                }
+                line.startsWith("#EXT-X-MEDIA-SEQUENCE:") -> {
+                    if (segmentCount > 0) throw invalidPlaylist()
+                    mediaSequence = line.substringAfter(':').toULongOrNull() ?: throw invalidPlaylist()
                 }
                 line.startsWith("#EXT-X-MAP:") -> {
                     val attrs = attributes(line)
                     val url = resolve(base, attrs["URI"] ?: throw invalidPlaylist())
-                    val nextInit = Resource(url, attrs["BYTERANGE"]?.let { byteRange(it, 0L) })
+                    val nextInit = Resource(url, attrs["BYTERANGE"]?.let { byteRange(it, 0L) }, encryption(base, keys, null))
                     if (segmentCount > 0 && init != nextInit) throw invalidTimeline()
                     init = nextInit
                 }
@@ -294,7 +312,9 @@ internal class IntroAudioExtractor(context: Context) {
                     if (segmentCount == 0) init?.let(prefix::add)
                     val url = resolve(base, line)
                     val implicitOffset = previous?.takeIf { it.url == url }?.range?.last?.plus(1L)
-                    val resource = Resource(url, pendingRange?.let { byteRange(it, implicitOffset) })
+                    val sequence = mediaSequence + segmentCount.toULong()
+                    if (sequence < mediaSequence) throw invalidPlaylist()
+                    val resource = Resource(url, pendingRange?.let { byteRange(it, implicitOffset) }, encryption(base, keys, sequence))
                     prefix += resource
                     previous = resource
                     pendingRange = null
@@ -309,6 +329,27 @@ internal class IntroAudioExtractor(context: Context) {
         return prefix
     }
 
+    private fun encryption(base: String, keys: Map<String, KeyTag>, sequence: ULong?): Encryption? {
+        if (keys.isEmpty()) return null
+        val key = keys["identity"] ?: throw unsupportedEncryption()
+        if (keys.values.any { it.attributes["METHOD"] != "AES-128" }) throw unsupportedEncryption()
+        val versions = key.attributes["KEYFORMATVERSIONS"]?.split('/') ?: listOf("1")
+        if ("1" !in versions) throw unsupportedEncryption()
+        val keyUri = key.attributes["URI"]?.takeIf { it.isNotBlank() } ?: throw invalidKey()
+        val keyUrl = try { resolve(base, keyUri) } catch (_: IOException) {
+            throw invalidKey()
+        }
+        if (!keyUrl.startsWith("https://", true) && !keyUrl.startsWith("http://", true)) throw invalidKey()
+        val explicit = key.attributes["IV"]
+        val iv = if (explicit != null) {
+            if (!HexIv.matches(explicit)) throw IntroAudioScanException("HLS 播放列表的 AES-128 IV 无效。")
+            explicit.substring(2)
+        } else {
+            sequence?.toString(16) ?: throw IntroAudioScanException("加密 HLS 的初始化分片缺少 AES-128 IV。")
+        }
+        return Encryption(key.declaration, keyUrl, iv.lowercase().padStart(32, '0'))
+    }
+
     private fun byteRange(value: String, implicitOffset: Long?): LongRange {
         val length = value.substringBefore('@').toLongOrNull() ?: throw invalidPlaylist()
         val offset = if ('@' in value) value.substringAfter('@').toLongOrNull() else implicitOffset
@@ -321,11 +362,14 @@ internal class IntroAudioExtractor(context: Context) {
 
     private fun invalidPlaylist() = IntroAudioScanException("HLS 播放列表格式无法识别。")
     private fun invalidTimeline() = IntroAudioScanException("这条 HLS 线路开头的时间轴不连续，无法可靠识别片头。")
+    private fun unsupportedEncryption() = IntroAudioScanException("这条 HLS 线路使用暂不支持的加密方式，无法识别片头。")
+    private fun invalidKey() = IntroAudioScanException("HLS 播放列表的 AES-128 密钥地址无效。")
 
     private fun resolve(base: String, relative: String): String = URL(URL(base), relative).toString()
 
     private class ScanNetwork(private val budget: IntroAudioScanBudget) {
         private var episodeBytes = 0L
+        private val keys = mutableMapOf<Int, ByteArray>()
 
         data class Probe(val url: String, val playlist: String?, val totalBytes: Long?, val incompletePlaylist: Boolean = false)
         private data class ResponseRange(val start: Long, val end: Long, val total: Long?)
@@ -372,14 +416,51 @@ internal class IntroAudioExtractor(context: Context) {
         }
 
         fun download(resource: Resource, output: OutputStream) {
+            val cipher = resource.encryption?.let { encryption ->
+                val key = keys.getOrPut(encryption.declaration) { downloadKey(encryption.keyUrl) }
+                val iv = ByteArray(16) { index -> encryption.ivHex.substring(index * 2, index * 2 + 2).toInt(16).toByte() }
+                Cipher.getInstance("AES/CBC/PKCS5Padding").apply {
+                    init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                }
+            }
             open(resource.url, resource.range) { connection ->
                 val expected = if (resource.range != null) {
                     val range = responseRange(connection, resource.range)
                     if (range.end != resource.range.last) throw IntroAudioScanException("HLS 分片未返回完整的字节范围。")
                     range.end - range.start + 1L
                 } else connection.contentLengthLong.takeIf { it >= 0L }
-                connection.inputStream.use { copy(it, output, SegmentBytes, expected) }
+                connection.inputStream.use { copy(it, output, SegmentBytes, expected, cipher) }
             }
+        }
+
+        private fun downloadKey(url: String): ByteArray {
+            // A declaration is used by at least one selected segment or init section, so the
+            // segment cap also bounds key requests. Read one extra byte to reject oversized keys.
+            val bytes = ByteArray(17)
+            if (remaining() < bytes.size) throw scanSizeLimit()
+            val count = try {
+                open(url) { connection ->
+                    val length = connection.contentLengthLong
+                    if (length >= 0L && length != 16L) return@open 0
+                    val limit = if (length == 16L) 16 else bytes.size
+                    connection.inputStream.use { input ->
+                        var received = 0
+                        while (received < limit) {
+                            budget.check()
+                            val size = input.read(bytes, received, limit - received)
+                            if (size < 0) break
+                            account(size)
+                            received += size
+                        }
+                        received
+                    }
+                }
+            } catch (_: IOException) {
+                budget.check()
+                throw IntroAudioScanException("无法读取 HLS 解密密钥，请确认这条线路可正常播放。")
+            }
+            if (count != 16) throw IntroAudioScanException("片源返回了无效的 HLS AES-128 密钥。")
+            return bytes.copyOf(count)
         }
 
         fun range(url: String, start: Long, end: Long, length: Long): ByteArray = open(url, start..end) { connection ->
@@ -434,7 +515,7 @@ internal class IntroAudioExtractor(context: Context) {
             return ResponseRange(start, end, total)
         }
 
-        private fun copy(input: java.io.InputStream, output: OutputStream, limit: Int, expected: Long?) {
+        private fun copy(input: java.io.InputStream, output: OutputStream, limit: Int, expected: Long?, cipher: Cipher? = null) {
             val allowed = minOf(limit.toLong(), remaining())
             if (expected != null && expected > allowed) throw scanSizeLimit()
             val effectiveLimit = expected ?: allowed
@@ -445,12 +526,22 @@ internal class IntroAudioExtractor(context: Context) {
                 val size = input.read(data, 0, minOf(data.size.toLong(), effectiveLimit - written).toInt())
                 if (size < 0) break
                 account(size)
-                output.write(data, 0, size)
+                if (cipher == null) output.write(data, 0, size)
+                else cipher.update(data, 0, size)?.let(output::write)
                 written += size
             }
             if (expected != null && written != expected) throw IntroAudioScanException("片源返回的数据不完整。")
             if (expected == null && written == effectiveLimit) throw scanSizeLimit()
+            if (cipher != null) {
+                if (written == 0L || written % 16L != 0L) throw invalidEncryptedSegment()
+                val tail = try { cipher.doFinal() } catch (_: GeneralSecurityException) {
+                    throw invalidEncryptedSegment()
+                }
+                output.write(tail)
+            }
         }
+
+        private fun invalidEncryptedSegment() = IntroAudioScanException("HLS 分片无法用片源提供的 AES-128 密钥解密。")
 
         private fun remaining(): Long = minOf(EpisodeByteLimit - episodeBytes, budget.remainingBytes()).coerceAtLeast(0L)
 
@@ -512,6 +603,7 @@ internal class IntroAudioExtractor(context: Context) {
         const val SegmentBytes = 12 * 1024 * 1024
         const val BlockBytes = 512 * 1024
         val Attribute = Regex("([A-Z0-9-]+)=(\"[^\"]*\"|[^,]*)")
+        val HexIv = Regex("0[xX][0-9a-fA-F]{1,32}")
         val ContentRange = Regex("bytes (\\d+)-(\\d+)/(\\d+|\\*)", RegexOption.IGNORE_CASE)
     }
 }
