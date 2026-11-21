@@ -24,11 +24,15 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -88,16 +92,31 @@ fun PlayerScreen(
     val offlineCache = remember(context) { OfflineCacheManager.get(context.applicationContext) }
     val offlineState = offlineCache.state
     var cacheNotice by remember { mutableStateOf<String?>(null) }
-    val currentUrl = episodes.getOrNull(episode - Playback.FirstEpisode)?.url.orEmpty()
+    val currentIndex = episode - Playback.FirstEpisode
+    val currentEpisode = episodes.getOrNull(currentIndex)
+    val currentUrl = currentEpisode?.url.orEmpty()
+    val introReference = episodes.getOrNull(currentIndex + 1)?.takeIf { it.url.isNotBlank() && it.url != currentUrl }
+        ?: episodes.getOrNull(currentIndex - 1)?.takeIf { it.url.isNotBlank() && it.url != currentUrl }
     val playbackKey = ContentCacheKey.root(movie.id, routeId, episode)
     val introPreferences = remember(context, movie.id, route.id) {
         IntroSkipPreferences(context.applicationContext, movie.id, route.id)
     }
     var introRule by remember(introPreferences) { mutableStateOf(introPreferences.read()) }
     var introChecked by rememberSaveable(playbackKey) { mutableStateOf(false) }
+    var detectedIntro by remember(introPreferences, currentEpisode) {
+        mutableStateOf(currentEpisode?.let(introPreferences::readDetection))
+    }
+    var detectedIntroSkipped by rememberSaveable(playbackKey, currentUrl) { mutableStateOf(false) }
+    var detectionRequest by remember(playbackKey, currentUrl) { mutableStateOf<Any?>(null) }
+    val request = detectionRequest
+    var detectionMessage by remember(playbackKey, currentUrl) { mutableStateOf<String?>(null) }
+    val introPanelOpen = panel == IntroSettingsPanel
+    val windowFocused = LocalWindowInfo.current.isWindowFocused
     val currentMediaReady = loadedPlaybackKey == playbackKey && playbackSession.selection?.key == playbackKey &&
         controller.errorMessage == null && !controller.isBuffering
-    val showIntroSkip = active && currentMediaReady && introRule.canSkip(position, knownDuration)
+    val canSkipIntro = if (introRule.endMillis > 0L) introRule.canSkip(position, knownDuration)
+        else detectedIntro?.canSkip(position, knownDuration) == true
+    val showIntroSkip = active && currentMediaReady && canSkipIntro
     val latestPlaybackKey by rememberUpdatedState(playbackKey)
     val playbackControlsVisible = active && (controlsVisible || panel != null)
     // 控制栏在相邻页也会先组合一次，回调必须读取最新的 active，不能依赖闭包里的首帧值。
@@ -153,7 +172,13 @@ fun PlayerScreen(
         if (loadedPlaybackKey != latestPlaybackKey || loadedPlaybackKey != playbackSession.selection?.key ||
             controller.errorMessage != null || controller.isBuffering) return
         refreshProgress()
-        if (introRule.canSkip(position, controller.getDuration())) seekTo(introRule.endMillis)
+        val duration = controller.getDuration()
+        if (introRule.endMillis > 0L) {
+            if (introRule.canSkip(position, duration)) seekTo(introRule.endMillis)
+        } else detectedIntro?.takeIf { it.canSkip(position, duration) }?.let {
+            detectedIntroSkipped = true
+            seekTo(it.endMillis)
+        }
     }
     fun selectEpisode(number: Int) {
         if (!activeNow.value) return
@@ -211,6 +236,45 @@ fun PlayerScreen(
     LaunchedEffect(cacheNotice) {
         if (cacheNotice != null) { delay(4_000L); cacheNotice = null }
     }
+    LaunchedEffect(request, active, introPanelOpen, windowFocused, playbackKey, currentUrl, introReference) {
+        if (request == null) return@LaunchedEffect
+        try {
+            val first = currentEpisode ?: return@LaunchedEffect
+            val second = introReference ?: return@LaunchedEffect
+            if (!active || !introPanelOpen || !windowFocused) return@LaunchedEffect
+            val match = withContext(Dispatchers.IO) {
+                val scanContext = currentCoroutineContext()
+                val budget = IntroAudioScanBudget { !scanContext.isActive }
+                val extractor = IntroAudioExtractor(context.applicationContext)
+                val current = IntroAudioFingerprint.Collector()
+                extractor.scan(first.url, budget, current::appendPcm16)
+                val reference = IntroAudioFingerprint.Collector()
+                extractor.scan(second.url, budget, reference::appendPcm16)
+                IntroAudioFingerprint.match(current.finish(), reference.finish(), budget::check)
+            }
+            currentCoroutineContext().ensureActive()
+            if (detectionRequest !== request || panel != IntroSettingsPanel ||
+                !activeNow.value || latestPlaybackKey != playbackKey) return@LaunchedEffect
+            if (match == null) {
+                detectionMessage = "前 3 分钟内没有找到可靠的重复片头"
+            } else {
+                val range = DetectedIntro(match.startMillis, match.endMillis)
+                val referenceRange = DetectedIntro(match.referenceStartMillis, match.referenceEndMillis)
+                introPreferences.saveDetections(first, range, second, referenceRange)
+                detectedIntro = range
+                detectedIntroSkipped = false
+                detectionMessage = "已保存两集各自的片头位置"
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (error: IntroAudioScanException) {
+            detectionMessage = error.message ?: "暂时无法识别此线路的音频"
+        } catch (_: Exception) {
+            detectionMessage = "暂时无法识别此线路的音频"
+        } finally {
+            if (detectionRequest === request) detectionRequest = null
+        }
+    }
     LaunchedEffect(movie.id, routeId, episode, active) {
         if (!active) return@LaunchedEffect
         loadedPlaybackKey = null
@@ -220,10 +284,16 @@ fun PlayerScreen(
         var lastSave = Playback.Start
         while (true) {
             refreshProgress()
-            if (!introChecked && controller.isPlaying && !controller.isBuffering &&
+            if (controller.isPlaying && !controller.isBuffering &&
                 loadedPlaybackKey == latestPlaybackKey && loadedPlaybackKey == playbackSession.selection?.key) {
-                introChecked = true
-                if (introRule.automatic) skipIntro()
+                if (!introChecked) {
+                    introChecked = true
+                    if (introRule.endMillis > 0L && introRule.automatic) skipIntro()
+                }
+                if (introRule.endMillis == 0L && introRule.automatic && !detectedIntroSkipped &&
+                    detectedIntro?.canSkip(position, knownDuration) == true) {
+                    skipIntro()
+                }
             }
             // 控制器结合当前集余量、倍速与缓冲状态决定是否启动/暂停下一集 native 预准备。
             playbackSession.preload(RetainedPlayback(movie.id, routeId, episode + Playback.FirstEpisode, episodes.getOrNull(episode)?.url.orEmpty()))
@@ -414,10 +484,25 @@ fun PlayerScreen(
                         }
                         if (panel == IntroSettingsPanel) {
                             IntroSkipSettings(
-                                endMillis = introRule.endMillis.takeIf { it > 0L },
+                                manualEndMillis = introRule.endMillis.takeIf { it > 0L },
+                                detected = detectedIntro,
                                 autoSkip = introRule.automatic,
                                 currentMillis = position,
                                 canSetEnd = currentMediaReady && position in MinimumIntroEndMillis until knownDuration,
+                                canDetect = currentUrl.isNotBlank() && introReference != null,
+                                detecting = request != null,
+                                playing = controller.isPlaying,
+                                detectionMessage = detectionMessage,
+                                onDetect = {
+                                    if (detectionRequest != null) {
+                                        detectionRequest = null
+                                        detectionMessage = "已停止识别"
+                                    } else if (currentUrl.isNotBlank() && introReference != null) {
+                                        if (controller.isPlaying || controller.isBuffering) controller.pause()
+                                        detectionMessage = null
+                                        detectionRequest = Any()
+                                    }
+                                },
                                 onSetEnd = {
                                     refreshProgress()
                                     if (loadedPlaybackKey == latestPlaybackKey &&
@@ -428,7 +513,15 @@ fun PlayerScreen(
                                     }
                                 },
                                 onAutoSkipChange = { updateIntroRule(introRule.copy(automatic = it)) },
-                                onClear = { updateIntroRule(IntroSkipRule()) },
+                                onClear = {
+                                    if (introRule.endMillis > 0L) {
+                                        updateIntroRule(IntroSkipRule(automatic = detectedIntro != null && introRule.automatic))
+                                    } else {
+                                        currentEpisode?.let(introPreferences::clearDetection)
+                                        detectedIntro = null
+                                        detectionMessage = null
+                                    }
+                                },
                             )
                         } else if (panel == "选集") {
                             LazyVerticalGrid(columns = GridCells.Fixed(panelColumns), modifier = Modifier.weight(Theme.Size.Weight), horizontalArrangement = Arrangement.spacedBy(Theme.Space.Small), verticalArrangement = Arrangement.spacedBy(Theme.Space.Small)) {

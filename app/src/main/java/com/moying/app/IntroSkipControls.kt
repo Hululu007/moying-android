@@ -27,40 +27,70 @@ internal fun IntroSkipButton(onClick: () -> Unit, modifier: Modifier = Modifier)
 
 @Composable
 internal fun IntroSkipSettings(
-    endMillis: Long?,
+    manualEndMillis: Long?,
+    detected: DetectedIntro?,
     autoSkip: Boolean,
     currentMillis: Long,
     canSetEnd: Boolean,
+    canDetect: Boolean,
+    detecting: Boolean,
+    playing: Boolean,
+    detectionMessage: String?,
+    onDetect: () -> Unit,
     onSetEnd: () -> Unit,
     onAutoSkipChange: (Boolean) -> Unit,
     onClear: () -> Unit,
 ) {
+    val hasIntro = manualEndMillis != null || detected != null
     Column(
         Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
             .padding(horizontal = Theme.Space.Large, vertical = Theme.Space.Small),
         verticalArrangement = Arrangement.spacedBy(Theme.Space.Small),
     ) {
         AppText(
-            if (endMillis == null) "把进度拖到正片开头，再设为片头结束点。"
-            else "这部剧当前线路的片头结束于 ${formatTime(endMillis)}",
+            when {
+                manualEndMillis != null -> "当前线路的手动片头结束点为 ${formatTime(manualEndMillis)}"
+                detected != null -> "本集识别到片头 ${formatTime(detected.startMillis)}–${formatTime(detected.endMillis)}"
+                canDetect -> "识别片头会比较同一线路的相邻两集。也可以手动设置结束点。"
+                else -> "当前线路没有可比对的相邻集，可以手动设置片头结束点。"
+            },
             style = Theme.Type.Caption,
             color = Theme.Colors.Secondary,
         )
+        if (canDetect || detecting) {
+            ActionButton(
+                when {
+                    detecting -> "停止识别"
+                    playing -> "暂停并识别片头"
+                    else -> "识别片头"
+                },
+                onDetect,
+                modifier = Modifier.fillMaxWidth(),
+                primary = false,
+            )
+        }
+        if (detecting || detectionMessage != null) {
+            AppText(
+                if (detecting) "正在比较两集开场的音频…" else detectionMessage.orEmpty(),
+                style = Theme.Type.Caption,
+                color = Theme.Colors.Secondary,
+            )
+        }
         ActionButton(
             "将 ${formatTime(currentMillis)} 设为片头结束",
             onSetEnd,
             modifier = Modifier.fillMaxWidth(),
             primary = false,
-            enabled = canSetEnd,
+            enabled = canSetEnd && !detecting,
         )
-        val checked = endMillis != null && autoSkip
+        val checked = hasIntro && autoSkip
         val feedback = LocalInteractionHaptics.current
         Row(
             Modifier.fillMaxWidth().heightIn(min = Theme.Size.Touch)
                 .clip(RoundedCornerShape(Theme.Radius.Control))
                 .toggleable(
                     value = checked,
-                    enabled = endMillis != null,
+                    enabled = hasIntro,
                     role = Role.Switch,
                     onValueChange = {
                         feedback.tap()
@@ -75,7 +105,7 @@ internal fun IntroSkipSettings(
                 "自动跳过片头",
                 modifier = Modifier.weight(1f),
                 style = Theme.Type.Label,
-                color = if (endMillis != null) Theme.Colors.Text else Theme.Colors.Muted,
+                color = if (hasIntro) Theme.Colors.Text else Theme.Colors.Muted,
             )
             Box(
                 Modifier.size(width = 44.dp, height = 26.dp)
@@ -92,8 +122,14 @@ internal fun IntroSkipSettings(
                 )
             }
         }
-        if (endMillis != null) {
-            ActionButton("清除片头设置", onClear, modifier = Modifier.fillMaxWidth(), primary = false)
+        if (hasIntro) {
+            ActionButton(
+                if (manualEndMillis != null) "清除手动结束点" else "清除本集识别结果",
+                onClear,
+                modifier = Modifier.fillMaxWidth(),
+                primary = false,
+                enabled = !detecting,
+            )
         }
     }
 }

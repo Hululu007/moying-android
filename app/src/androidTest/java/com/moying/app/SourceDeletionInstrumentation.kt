@@ -45,6 +45,14 @@ class SourceDeletionInstrumentation : Instrumentation() {
             "stream-cache" -> { StreamingCacheRegression.run(this, suiteArguments); return }
             "source-requests" -> { runSuite { SourceRequestRegression.run() }; return }
             "poster-loader" -> { runSuite { PosterLoaderRegression.run(targetContext) }; return }
+            "intro-audio-fingerprint" -> {
+                runSuite {
+                    IntroAudioFingerprintRegression.run()
+                    Bundle().apply { putString("fingerprint", "passed") }
+                }
+                return
+            }
+            "intro-audio-extractor" -> { runSuite { IntroAudioExtractorRegression.run(targetContext, suiteArguments) }; return }
             "native-player" -> { runSuite { NativePlayerRegression.run(this, suiteArguments) }; return }
             "glass-idle" -> { runSuite { GlassIdleRegression.run(this, suiteArguments) }; return }
             "offline-playback" -> { runSuite { OfflinePlaybackRegression.run() }; return }
