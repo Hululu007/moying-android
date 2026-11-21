@@ -19,6 +19,7 @@ internal data class SourceImportBatch(
     val sources: MutableList<TvBoxSource> = mutableListOf(),
     val movies: MutableList<JSONObject> = mutableListOf(),
     var skipped: Int = 0,
+    var skippedPluginSites: Int = 0,
     val notes: MutableList<String> = mutableListOf(),
 )
 
@@ -51,11 +52,17 @@ internal object SourceImport {
     const val MAX_SOURCES = 120
     private const val MAX_REQUESTS = 8
     private const val MAX_TOTAL_BYTES = 12 * 1024 * 1024
+    private const val DOWNLOAD_TIMEOUT = 18_000L
+    private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 13) Moying/1.3"
+    private const val TVBOX_USER_AGENT = "TVBox"
     private const val RESOLVER_TOKEN = "{url}"
     private const val URL_PLACEHOLDER = "moying-episode-address-placeholder"
     private val mediaExtensions = listOf(".m3u8", ".mp4", ".m4v", ".webm", ".mov", ".mp3", ".aac", ".ts")
     private val resolverUrlParameter = Regex("[?&]url=$", RegexOption.IGNORE_CASE)
     private val resolverResponsePath = Regex("[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+){0,4}")
+    private val htmlStart = Regex("^<(?:!doctype\\s+html|html|head|body)\\b", RegexOption.IGNORE_CASE)
+
+    private data class DownloadedText(val text: String, val address: String)
 
     fun hash(value: String): String = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
         .take(12).joinToString("") { "%02x".format(it) }
@@ -155,11 +162,61 @@ internal object SourceImport {
         builder.build().toString().trimEnd('/')
     }.getOrDefault(api.trim().trimEnd('/'))
 
+    private fun configAddress(value: String, origin: String): String? {
+        val address = value.trim()
+        if (validUrl(address)) return address
+        if (address.isEmpty() || !validUrl(origin)) return null
+        return runCatching {
+            val relative = URI(address)
+            if (relative.isAbsolute || relative.rawPath.isNullOrEmpty() && relative.rawAuthority == null) return null
+            URL(URL(origin), address).toString().takeIf(::validUrl)
+        }.getOrNull()
+    }
+
+    // TVBox 配置可以在 JSON 前写注释。只移动 JSON 的起点，保留 URL 和普通列表文本。
+    private fun afterJsonComments(text: String): String {
+        var index = 0
+        while (index < text.length) {
+            when {
+                text[index].isWhitespace() -> index++
+                text.startsWith("//", index) -> {
+                    index = text.indexOfAny(charArrayOf('\r', '\n'), index + 2)
+                    if (index < 0) return text
+                }
+                text.startsWith("/*", index) -> {
+                    val close = text.indexOf("*/", index + 2)
+                    if (close < 0) return text
+                    index = close + 2
+                }
+                text[index] == '{' || text[index] == '[' -> return text.substring(index)
+                else -> return text
+            }
+        }
+        return text
+    }
+
+    private fun isHtml(text: String): Boolean {
+        val content = text.trimStart { it.isWhitespace() || it == '\uFEFF' }
+        val start = if (content.startsWith("<!--")) content.substringAfter("-->", "").trimStart() else content
+        return htmlStart.containsMatchIn(start)
+    }
+
     /** 输入 HTTP(S) 文本地址，限制单次大小、重定向次数及总耗时。调用方必须在 IO 线程执行。 */
-    fun download(address: String): String {
+    fun download(address: String, userAgent: String? = null): String =
+        downloadText(address, userAgent ?: DEFAULT_USER_AGENT, SystemClock.elapsedRealtime() + DOWNLOAD_TIMEOUT).text
+
+    private fun downloadSubscription(address: String): DownloadedText {
+        val deadline = SystemClock.elapsedRealtime() + DOWNLOAD_TIMEOUT
+        val standard = downloadText(address, DEFAULT_USER_AGENT, deadline)
+        if (!isHtml(standard.text)) return standard
+        val compatible = downloadText(address, TVBOX_USER_AGENT, deadline)
+        require(!isHtml(compatible.text)) { "订阅地址返回了网页，未取得片源配置" }
+        return compatible
+    }
+
+    private fun downloadText(address: String, userAgent: String, deadline: Long): DownloadedText {
         require(validUrl(address)) { "只支持 HTTP(S) 订阅地址" }
         var current = address
-        val deadline = SystemClock.elapsedRealtime() + 18_000L
         repeat(5) {
             SourceRequests.timeout(6000, deadline)
             val connection = URL(current).openConnection() as HttpURLConnection
@@ -168,7 +225,7 @@ internal object SourceImport {
                 connection.connectTimeout = SourceRequests.timeout(6000, deadline)
                 connection.readTimeout = SourceRequests.timeout(8000, deadline)
                 connection.instanceFollowRedirects = false
-                connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 13) Moying/1.3")
+                connection.setRequestProperty("User-Agent", userAgent)
                 val code = connection.responseCode
                 SourceRequests.timeout(8000, deadline)
                 if (code in listOf(301, 302, 303, 307, 308)) {
@@ -191,7 +248,8 @@ internal object SourceImport {
                     }
                     SourceRequests.timeout(8000, deadline)
                     val charsetName = connection.contentType.orEmpty().substringAfter("charset=", "UTF-8").substringBefore(';').trim().trim('"')
-                    return result.toByteArray().toString(runCatching { charset(charsetName) }.getOrDefault(Charsets.UTF_8))
+                    val text = result.toByteArray().toString(runCatching { charset(charsetName) }.getOrDefault(Charsets.UTF_8))
+                    return DownloadedText(text, current)
                 }
             } finally { SourceRequests.release(connection); connection.disconnect() }
         }
@@ -208,9 +266,10 @@ internal object SourceImport {
         fun visit(raw: String, from: String, depth: Int) {
             if (Thread.currentThread().isInterrupted) throw InterruptedException("导入已取消")
             require(raw.toByteArray().size <= MAX_BYTES) { "导入内容超过 4 MiB" }
-            val text = raw.trim().trimStart('\uFEFF').trim()
+            val content = raw.trim().trimStart('\uFEFF').trim()
+            val text = afterJsonComments(content)
             if (text.isBlank()) return
-            totalBytes += text.toByteArray().size
+            totalBytes += content.toByteArray().size
             require(totalBytes <= MAX_TOTAL_BYTES) { "订阅总内容超过 12 MiB" }
             if (validUrl(text)) {
                 if (mediaUrl(text)) {
@@ -241,7 +300,14 @@ internal object SourceImport {
                     batch.skipped++; batch.notes += "已达到嵌套订阅或请求上限"; return
                 }
                 requestCount++
-                runCatching { visit(download(text), text, depth + 1) }.onFailure { batch.skipped++; batch.notes += it.message.orEmpty() }
+                runCatching {
+                    val downloaded = downloadSubscription(text)
+                    visit(downloaded.text, downloaded.address, depth + 1)
+                }.onFailure {
+                    if (it is InterruptedException) throw it
+                    batch.skipped++
+                    batch.notes += it.message.orEmpty()
+                }
                 return
             }
             if (text.startsWith("{")) {
@@ -253,8 +319,13 @@ internal object SourceImport {
                         val row = sites.optJSONObject(i)
                         if (row == null) { batch.skipped++; continue }
                         val type = row.optInt("type", -1)
-                        val api = row.optString("api")
-                        if (type !in listOf(0, 1) || !validUrl(api) || batch.sources.size >= MAX_SOURCES) { batch.skipped++; continue }
+                        if (type !in 0..1) {
+                            if (type == 3) batch.skippedPluginSites++
+                            batch.skipped++
+                            continue
+                        }
+                        val api = configAddress(row.optString("api"), from)
+                        if (api == null || batch.sources.size >= MAX_SOURCES) { batch.skipped++; continue }
                         val format = row.optString("format").takeIf { it == "m3u" } ?: "cms"
                         batch.sources += TvBoxSource(
                             "import:" + hash(sourceKey(api)), clean(row.optString("name")).ifBlank { URI(api).host }, api, type, from, format,
@@ -264,11 +335,29 @@ internal object SourceImport {
                         )
                     }
                 }
+                val lives = root.optJSONArray("lives")
+                if (lives != null) for (i in 0 until lives.length()) {
+                    val row = lives.optJSONObject(i)
+                    if (row == null) { batch.skipped++; continue }
+                    val type = row.optInt("type", 0)
+                    if (type !in 0..1) {
+                        if (type == 3) batch.skippedPluginSites++
+                        batch.skipped++
+                        continue
+                    }
+                    val url = configAddress(row.optString("url"), from)
+                    if (url == null || batch.sources.size >= MAX_SOURCES) { batch.skipped++; continue }
+                    val headers = mergePlaybackHeaders(mapOf("User-Agent" to row.optString("ua")), declaredPlaybackHeaders(row))
+                    batch.sources += TvBoxSource(
+                        "import:" + hash(sourceKey(url)), clean(row.optString("name")).ifBlank { "直播目录" }, url,
+                        type, from, "m3u", playbackHeaders = headers,
+                    )
+                }
                 // 多仓订阅仅递归有限个配置；不能执行的 Spider 站点会明确计入跳过数。
                 val warehouses = root.optJSONArray("urls")
                 if (warehouses != null) for (i in 0 until minOf(warehouses.length(), MAX_SOURCES)) {
-                    val url = warehouses.optJSONObject(i)?.optString("url").orEmpty()
-                    if (validUrl(url)) visit(url, from, depth) else batch.skipped++
+                    val url = configAddress(warehouses.optJSONObject(i)?.optString("url").orEmpty(), from)
+                    if (url != null) visit(url, from, depth) else batch.skipped++
                 }
                 val list = root.optJSONArray("movies") ?: root.optJSONArray("list")
                 if (list != null) {
@@ -276,7 +365,7 @@ internal object SourceImport {
                         batch.sources += TvBoxSource("import:" + hash(sourceKey(from)), URI(from).host, sourceKey(from), 1, from)
                     }
                     appendRows(list, batch, from)
-                } else if (sites == null && warehouses == null) {
+                } else if (sites == null && lives == null && warehouses == null) {
                     normalizeMovie(root, origin = from)?.let { batch.movies += it } ?: run { batch.skipped++ }
                 }
                 return

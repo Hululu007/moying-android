@@ -358,6 +358,108 @@ class SourceDeletionInstrumentation : Instrumentation() {
                 }
             }
 
+            testCase("TVBox subscription negotiation resolves redirected relative sources") { isolated ->
+                val normalAgent = "Mozilla/5.0 (Linux; Android 13) Moying/1.3"
+                val liveAgent = "FixtureLive/1.0"
+                val requests = ConcurrentLinkedQueue<Pair<Uri, String>>()
+                CmsFixture(httpResponse = { request, userAgent ->
+                    requests += request to userAgent
+                    when (request.path) {
+                        "/import/portal" -> if (userAgent.contains("TVBox", ignoreCase = true)) {
+                            FixtureResponse(status = "302 Found", location = "../dir/actual.json")
+                        } else {
+                            FixtureResponse("<html><title>Subscription landing page</title></html>", "text/html")
+                        }
+                        "/dir/actual.json" -> FixtureResponse("""
+                            /* Subscription header */
+                            // This is a TVBox configuration.
+                            {
+                              "sites": [
+                                {"name":"Relative CMS","type":1,"api":"./api/vod?auth=fixture"},
+                                {"name":"Plugin fixture","type":3,"api":"csp_fixture","jar":"./fixture.jar"}
+                              ],
+                              "lives": [
+                                {"name":"Relative Live","type":0,"url":"../live/channels.m3u","ua":"$liveAgent"}
+                              ]
+                            }
+                        """.trimIndent())
+                        "/dir/api/vod" -> FixtureResponse("""
+                            {"pagecount":1,"list":[{
+                              "vod_id":"fixture","vod_name":"Negotiated CMS sample","type_name":"电影",
+                              "vod_play_url":"正片${'$'}http://127.0.0.1/sample.mp4"
+                            }]}
+                        """.trimIndent())
+                        "/live/channels.m3u" -> FixtureResponse("""
+                            #EXTM3U
+                            #EXTINF:-1 group-title="新闻",Negotiated live sample
+                            http://127.0.0.1/fixture.m3u8
+                        """.trimIndent(), "application/x-mpegURL")
+                        else -> FixtureResponse(status = "404 Not Found")
+                    }
+                }).use { fixture ->
+                    val repository = TvBoxMovieRepository(isolated)
+                    val result = repository.importSources("${fixture.base}/import/portal")
+                    assertThat(result.addedSources == 2 && result.addedMovies == 0 && result.skipped == 1,
+                        "subscription adds the CMS and live directory and skips the plugin: ${result.message}")
+                    val cms = repository.sources.single { it.name == "Relative CMS" }
+                    val live = repository.sources.single { it.name == "Relative Live" }
+                    assertThat(cms.api == "${fixture.base}/dir/api/vod?auth=fixture",
+                        "CMS address uses the final response URL as its base")
+                    assertThat(live.api == "${fixture.base}/live/channels.m3u" && live.format == "m3u",
+                        "live address uses the final response URL and is stored as a playlist")
+                    assertThat(live.playbackHeaders["User-Agent"] == liveAgent,
+                        "TVBox live user agent is stored as a playback header")
+
+                    val imports = requests.toList()
+                    assertThat(imports.map { it.first.path } == listOf("/import/portal", "/import/portal", "/dir/actual.json"),
+                        "subscription requests the landing page, retries with the TVBox user agent, and follows the redirect")
+                    assertThat(imports[0].second == normalAgent && imports[1].second.contains("TVBox", ignoreCase = true) &&
+                        imports[2].second == imports[1].second, "only the subscription retry and its redirect use the TVBox user agent")
+
+                    repository.selectSource(live.id)
+                    val restarted = TvBoxMovieRepository(isolated)
+                    assertThat(restarted.sources.single { it.id == cms.id } == cms &&
+                        restarted.sources.single { it.id == live.id } == live && restarted.selectedSourceId == live.id,
+                        "both imported sources and the selected source survive a repository restart")
+
+                    val cmsPage = restarted.getCatalogMovies(cms.id, 0, CatalogRecommend, "", emptyMap())
+                    val (cmsRequest, cmsAgent) = requests.last()
+                    assertThat(cmsPage.items.single().title == "Negotiated CMS sample" &&
+                        cmsRequest.getQueryParameter("auth") == "fixture" && cmsAgent == normalAgent,
+                        "the ordinary CMS request preserves the source query and uses the existing user agent")
+
+                    val liveMovie = restarted.getCatalogMovies(live.id, 0, CatalogRecommend, "", emptyMap()).items.single()
+                    assertThat(liveMovie.title == "Negotiated live sample" && requests.last().second == liveAgent,
+                        "the live directory uses the declared user agent")
+                    assertThat(restarted.getPlaybackRoutes(liveMovie.id).single().episodes.single().headers["User-Agent"] == liveAgent,
+                        "the playlist user agent applies to media playback")
+                }
+            }
+
+            testCase("commented local JSON import keeps existing M3U recognition") { isolated ->
+                val repository = TvBoxMovieRepository(isolated)
+                val api = "https://commented-subscription-test.invalid/vod"
+                val json = """
+                    // Local configuration header
+                    {"sites":[{"name":"Local commented CMS","type":1,"api":"$api"}]}
+                """.trimIndent()
+                val imported = repository.importSources("\uFEFF\n$json")
+                assertThat(imported.addedSources == 1 && imported.skipped == 0 && repository.sources.any { it.api == api },
+                    "pasted JSON accepts a BOM and leading comments without altering the URL")
+
+                val media = "https://commented-subscription-test.invalid/program.m3u8"
+                val m3u = """
+                    #EXTM3U
+                    # Playlist comment
+                    #EXTINF:-1,Local playlist sample
+                    $media
+                """.trimIndent()
+                val playlist = repository.importSources(m3u)
+                val movie = repository.getCatalogMovies("local", 0, CatalogRecommend, "Local playlist sample", emptyMap()).items.single()
+                assertThat(playlist.addedMovies == 1 && playlist.skipped == 0 && repository.getEpisodes(movie.id).single().url == media,
+                    "M3U headers and comments continue importing a playable local media entry")
+            }
+
             testCase("playlist groups and local filters before pagination") { isolated ->
                 val body = """
                     #EXTM3U
@@ -464,11 +566,22 @@ class SourceDeletionInstrumentation : Instrumentation() {
         }
     }
 
-    /** A bounded one-response HTTP fixture; no media is downloaded or played. */
-    private class CmsFixture(private val response: ((Uri) -> String)? = null) : Closeable {
+    private data class FixtureResponse(
+        val body: String = "",
+        val contentType: String = "application/json",
+        val status: String = "200 OK",
+        val location: String? = null,
+    )
+
+    /** A bounded HTTP fixture; no media is downloaded or played. */
+    private class CmsFixture(
+        private val httpResponse: ((Uri, String) -> FixtureResponse)? = null,
+        private val response: ((Uri) -> String)? = null,
+    ) : Closeable {
         private val server = ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"))
-        val api = "http://127.0.0.1:${server.localPort}/api.php/provide/vod"
-        private val body = JSONObject()
+        val base = "http://127.0.0.1:${server.localPort}"
+        val api = "$base/api.php/provide/vod"
+        private val defaultResponse = FixtureResponse(JSONObject()
             .put("page", 1).put("pagecount", 1).put("limit", 12).put("total", 1)
             .put("class", JSONArray().put(JSONObject().put("type_id", "1").put("type_name", "电影")))
             .put("list", JSONArray().put(JSONObject()
@@ -476,7 +589,7 @@ class SourceDeletionInstrumentation : Instrumentation() {
                 .put("vod_year", "2026").put("type_name", "电影")
                 .put("vod_play_from", "main\$\$\$backup")
                 .put("vod_play_url", "Episode 1\$http://127.0.0.1/first.m3u8#Episode 2\$http://127.0.0.1/second.m3u8\$\$\$Backup\$http://127.0.0.1/backup.mp4")))
-            .toString().toByteArray(Charsets.UTF_8)
+            .toString())
         private val thread = Thread({
             while (!server.isClosed) {
                 try {
@@ -485,16 +598,26 @@ class SourceDeletionInstrumentation : Instrumentation() {
                         val reader = socket.getInputStream().bufferedReader(Charsets.US_ASCII)
                         val requestTarget = reader.readLine()?.split(' ')?.getOrNull(1).orEmpty()
                         var headerBytes = 0
+                        var userAgent = ""
                         while (true) {
                             val line = reader.readLine() ?: break
                             headerBytes += line.length
                             check(headerBytes <= 16 * 1024) { "Request headers exceed fixture limit" }
                             if (line.isEmpty()) break
+                            if (line.substringBefore(':').equals("User-Agent", ignoreCase = true)) {
+                                userAgent = line.substringAfter(':').trim()
+                            }
                         }
-                        val reply = response?.invoke(Uri.parse("http://fixture$requestTarget"))?.toByteArray(Charsets.UTF_8) ?: body
+                        val request = Uri.parse("http://fixture$requestTarget")
+                        val reply = httpResponse?.invoke(request, userAgent)
+                            ?: response?.invoke(request)?.let { FixtureResponse(it) }
+                            ?: defaultResponse
+                        val payload = reply.body.toByteArray(Charsets.UTF_8)
+                        val location = reply.location?.let { "Location: $it\r\n" }.orEmpty()
                         socket.getOutputStream().apply {
-                            write("HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: ${reply.size}\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
-                            write(reply)
+                            write(("HTTP/1.1 ${reply.status}\r\nContent-Type: ${reply.contentType}; charset=UTF-8\r\n" +
+                                "${location}Content-Length: ${payload.size}\r\nConnection: close\r\n\r\n").toByteArray(Charsets.US_ASCII))
+                            write(payload)
                             flush()
                         }
                     }

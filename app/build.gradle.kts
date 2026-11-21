@@ -11,8 +11,8 @@ android {
         applicationId = "com.moying.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 94
-        versionName = "1.9.45"
+        versionCode = 95
+        versionName = "1.9.46"
         testInstrumentationRunner = "com.moying.app.SourceDeletionInstrumentation"
     }
     buildFeatures { compose = true }

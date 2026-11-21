@@ -110,7 +110,10 @@ internal object SourceAvailabilityProbe {
                     try {
                         val future = workers.submit {
                             val checked = try {
-                                val body = download(request, if (source.format == "m3u") source.api else cmsUrl(source))
+                                val playlist = source.format == "m3u"
+                                val address = if (playlist) source.api else cmsUrl(source)
+                                val userAgent = source.playbackHeaders["User-Agent"].takeIf { playlist } ?: Limits.USER_AGENT
+                                val body = download(request, address, userAgent)
                                 request.check()
                                 inspect(source, body, started)
                             } catch (cancelled: CancellationException) {
@@ -149,7 +152,7 @@ internal object SourceAvailabilityProbe {
     }
 
     /** 输入：受取消/总时限约束的 HTTP(S) 请求；输出：最多 4MiB 文本，沿用系统 TLS 校验。 */
-    private fun download(request: Request, address: String): String {
+    private fun download(request: Request, address: String, userAgent: String): String {
         var current = address
         for (redirect in 0..Limits.MAX_REDIRECTS) {
             request.check()
@@ -161,7 +164,7 @@ internal object SourceAvailabilityProbe {
                 connection.readTimeout = request.timeout()
                 connection.instanceFollowRedirects = false
                 connection.useCaches = false
-                connection.setRequestProperty("User-Agent", Limits.USER_AGENT)
+                connection.setRequestProperty("User-Agent", userAgent)
                 connection.setRequestProperty("Accept", "application/json, application/xml, text/xml, application/x-mpegURL, text/plain, */*")
                 connection.setRequestProperty("Accept-Encoding", "identity")
                 connection.setRequestProperty("Cache-Control", "no-cache, no-store")

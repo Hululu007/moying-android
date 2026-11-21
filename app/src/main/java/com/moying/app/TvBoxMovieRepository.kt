@@ -245,7 +245,8 @@ class TvBoxMovieRepository(context: Context) : MovieRepository, SourceAvailabili
                 pages.clear()
                 catalogPages.clear()
             }
-            val note = batch.notes.distinct().take(2).joinToString("；")
+            val pluginNote = "${batch.skippedPluginSites} 个站点需要 TVBox 插件".takeIf { batch.skippedPluginSites > 0 }
+            val note = (listOfNotNull(pluginNote) + batch.notes).distinct().take(2).joinToString("，")
             val detail = if (note.isBlank()) "" else "。$note"
             val message = "新增 $addedSources 个片源、$addedMovies 条媒体，跳过 $skipped 条（重复、不兼容或超出上限）$detail"
             return SourceImportResult(addedSources, addedMovies, skipped, message)
@@ -408,7 +409,9 @@ class TvBoxMovieRepository(context: Context) : MovieRepository, SourceAvailabili
     }
 
     private fun playlistMovies(source: TvBoxSource): List<Movie> =
-        playlists[source.id] ?: SourceImport.playlistRows(SourceImport.download(source.api), source.api, source.playbackHeaders).first.mapNotNull { row ->
+        playlists[source.id] ?: SourceImport.playlistRows(
+            SourceImport.download(source.api, source.playbackHeaders["User-Agent"]), source.api, source.playbackHeaders,
+        ).first.mapNotNull { row ->
             row.put("id", "tvbox:${source.id}:${SourceImport.hash(row.getJSONArray("episodes").getJSONObject(0).getString("url"))}")
                 .put("status", "直播").put("credit", "公开直播目录：${source.name}")
             rememberMovie(row, source)
