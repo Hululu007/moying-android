@@ -11,6 +11,8 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -98,6 +100,11 @@ fun PlayerScreen(
     val introReference = episodes.getOrNull(currentIndex + 1)?.takeIf { it.url.isNotBlank() && it.url != currentUrl }
         ?: episodes.getOrNull(currentIndex - 1)?.takeIf { it.url.isNotBlank() && it.url != currentUrl }
     val playbackKey = ContentCacheKey.root(movie.id, routeId, episode)
+    val needsResolution = currentEpisode?.resolver != null
+    val canResolve = !needsResolution || playbackSession.isForeground(playbackOwner)
+    var resolutionAttempt by remember(playbackKey, currentEpisode) { mutableIntStateOf(0) }
+    var resolutionError by remember(playbackKey, currentEpisode, resolutionAttempt) { mutableStateOf<String?>(null) }
+    val resolving = needsResolution && loadedPlaybackKey != playbackKey && resolutionError == null
     val introPreferences = remember(context, movie.id, route.id) {
         IntroSkipPreferences(context.applicationContext, movie.id, route.id)
     }
@@ -122,8 +129,10 @@ fun PlayerScreen(
     // 控制栏在相邻页也会先组合一次，回调必须读取最新的 active，不能依赖闭包里的首帧值。
     val activeNow = rememberUpdatedState(active)
     val videoAspect = controller.videoAspectRatio?.takeIf { playbackSession.selection?.movieId == movie.id } ?: Theme.Size.VideoAspect
+    val nextEpisode = episodes.getOrNull(episode)
     val nextBufferLabel = when {
-        episodes.getOrNull(episode) == null -> null
+        nextEpisode == null -> null
+        nextEpisode.resolver != null -> "下一集将在播放时解析"
         controller.nextBufferedDuration > Playback.Start -> "下一集已缓冲 ${formatTime(controller.nextBufferedDuration)}" +
             if (controller.nextPreloadDuration > Playback.Start) " / ${formatTime(controller.nextPreloadDuration)}" else ""
         controller.nextBufferedBytes > Playback.Start -> "下一集已缓存 ${formatCacheSize(controller.nextBufferedBytes)}"
@@ -148,7 +157,15 @@ fun PlayerScreen(
         loadedPlaybackKey?.let { playbackSession.saveProgress(repository, it) }
     }
     /** 输入：显式播放/重试操作；输出：接收 controller 的续播点，只有显式重播才允许归零。 */
-    fun playOrRetry() { if (activeNow.value) { controller.play(); position = controller.getPosition() } }
+    fun playOrRetry() {
+        if (!activeNow.value || resolving) return
+        if (resolutionError != null || (needsResolution && controller.errorMessage != null)) {
+            resolutionAttempt++
+        } else {
+            controller.play()
+            position = controller.getPosition()
+        }
+    }
     /** 输入：面板名；输出：在控制栏上方展开或收起面板，保留控制栏显示和操作。 */
     fun togglePanel(name: String) {
         if (!activeNow.value) return
@@ -243,13 +260,15 @@ fun PlayerScreen(
             val second = introReference ?: return@LaunchedEffect
             if (!active || !introPanelOpen || !windowFocused) return@LaunchedEffect
             val match = withContext(Dispatchers.IO) {
+                val currentMedia = resolvePlaybackEpisode(first)
+                val referenceMedia = resolvePlaybackEpisode(second)
                 val scanContext = currentCoroutineContext()
                 val budget = IntroAudioScanBudget { !scanContext.isActive }
                 val extractor = IntroAudioExtractor(context.applicationContext)
                 val current = IntroAudioFingerprint.Collector()
-                extractor.scan(first.url, budget, current::appendPcm16)
+                extractor.scan(currentMedia.url, budget, currentMedia.headers, current::appendPcm16)
                 val reference = IntroAudioFingerprint.Collector()
-                extractor.scan(second.url, budget, reference::appendPcm16)
+                extractor.scan(referenceMedia.url, budget, referenceMedia.headers, reference::appendPcm16)
                 IntroAudioFingerprint.match(current.finish(), reference.finish(), budget::check)
             }
             currentCoroutineContext().ensureActive()
@@ -267,6 +286,8 @@ fun PlayerScreen(
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
+        } catch (error: PlaybackResolutionException) {
+            detectionMessage = error.message ?: "无法解析这条线路"
         } catch (error: IntroAudioScanException) {
             detectionMessage = error.message ?: "暂时无法识别此线路的音频"
         } catch (_: Exception) {
@@ -275,12 +296,31 @@ fun PlayerScreen(
             if (detectionRequest === request) detectionRequest = null
         }
     }
-    LaunchedEffect(movie.id, routeId, episode, active) {
-        if (!active) return@LaunchedEffect
+    LaunchedEffect(playbackKey, currentEpisode, active, canResolve, resolutionAttempt) {
+        if (!active || !canResolve || resolutionError != null) return@LaunchedEffect
         loadedPlaybackKey = null
-        playbackSession.ensurePlayback(RetainedPlayback(movie.id, routeId, episode, currentUrl), movie.durationMillis, position)
-        if (currentUrl.isBlank()) return@LaunchedEffect
+        val requested = RetainedPlayback(movie.id, routeId, episode, currentUrl,
+            currentEpisode?.headers.orEmpty(), originalEpisode = currentEpisode)
+        val resolved = if (currentEpisode != null && needsResolution) {
+            val current = playbackSession.selection
+            if (current?.key == playbackKey && current.originalEpisode == currentEpisode &&
+                current.url.isNotBlank() && controller.errorMessage == null) {
+                current
+            } else {
+                playbackSession.ensurePlayback(requested.copy(url = ""), movie.durationMillis, position)
+                try {
+                    val media = resolvePlaybackEpisode(currentEpisode)
+                    requested.copy(url = media.url, headers = media.headers)
+                } catch (error: PlaybackResolutionException) {
+                    resolutionError = error.message ?: "无法解析这条线路"
+                    return@LaunchedEffect
+                }
+            }
+        } else requested
+        playbackSession.ensurePlayback(resolved, movie.durationMillis, position)
+        if (resolved.url.isBlank()) return@LaunchedEffect
         loadedPlaybackKey = playbackKey
+        val next = nextEpisode?.takeIf { it.resolver == null }
         var lastSave = Playback.Start
         while (true) {
             refreshProgress()
@@ -296,7 +336,7 @@ fun PlayerScreen(
                 }
             }
             // 控制器结合当前集余量、倍速与缓冲状态决定是否启动/暂停下一集 native 预准备。
-            playbackSession.preload(RetainedPlayback(movie.id, routeId, episode + Playback.FirstEpisode, episodes.getOrNull(episode)?.url.orEmpty()))
+            playbackSession.preload(RetainedPlayback(movie.id, routeId, episode + Playback.FirstEpisode, next?.url.orEmpty(), next?.headers.orEmpty()))
             if (System.currentTimeMillis() - lastSave >= Theme.Motion.HistorySaveMillis) {
                 saveProgress(); lastSave = System.currentTimeMillis()
             }
@@ -365,9 +405,16 @@ fun PlayerScreen(
                 },
             )
             Column(Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(Theme.Space.Small)) {
-                val message = controller.errorMessage ?: if (currentUrl.isBlank()) "暂无可播放地址" else if (controller.isBuffering) "正在缓冲…" else null
+                val error = resolutionError ?: controller.errorMessage.takeUnless { resolving }
+                val message = when {
+                    resolving -> "正在解析播放地址…"
+                    error != null -> error
+                    currentUrl.isBlank() -> "暂无可播放地址"
+                    controller.isBuffering -> "正在缓冲…"
+                    else -> null
+                }
                 if (message != null) AppText(message, style = Theme.Type.Caption, modifier = Modifier.background(Theme.Colors.Overlay).padding(Theme.Space.Medium))
-                if (active && controller.errorMessage != null) {
+                if (active && error != null) {
                     Row(horizontalArrangement = Arrangement.spacedBy(Theme.Space.Small)) {
                         ActionButton("重试", ::playOrRetry)
                         ActionButton("换源", { togglePanel("换源") }, primary = false)
@@ -524,7 +571,14 @@ fun PlayerScreen(
                                 },
                             )
                         } else if (panel == "选集") {
-                            LazyVerticalGrid(columns = GridCells.Fixed(panelColumns), modifier = Modifier.weight(Theme.Size.Weight), horizontalArrangement = Arrangement.spacedBy(Theme.Space.Small), verticalArrangement = Arrangement.spacedBy(Theme.Space.Small)) {
+                            val gridState = rememberLazyGridState(initialFirstVisibleItemIndex = currentIndex)
+                            LazyVerticalGrid(
+                                columns = GridCells.Fixed(panelColumns),
+                                modifier = Modifier.weight(Theme.Size.Weight),
+                                state = gridState,
+                                horizontalArrangement = Arrangement.spacedBy(Theme.Space.Small),
+                                verticalArrangement = Arrangement.spacedBy(Theme.Space.Small),
+                            ) {
                                 items(episodes, key = { it.number }) { track ->
                                     EpisodeCacheTile(
                                         label = track.name,
@@ -547,7 +601,15 @@ fun PlayerScreen(
                                 }
                             }
                         } else {
-                            LazyColumn(Modifier.weight(Theme.Size.Weight), verticalArrangement = Arrangement.spacedBy(Theme.Space.Small)) {
+                            val routeIndex = routes.indexOf(route)
+                            val listState = rememberLazyListState(
+                                initialFirstVisibleItemIndex = if (routeIndex > 0) routeIndex + 1 else 0,
+                            )
+                            LazyColumn(
+                                Modifier.weight(Theme.Size.Weight),
+                                state = listState,
+                                verticalArrangement = Arrangement.spacedBy(Theme.Space.Small),
+                            ) {
                                 item { AppText("播放线路", style = Theme.Type.Caption, color = Theme.Colors.Secondary) }
                                 items(routes, key = { it.id }) { item -> PlayerChip(item.name, { selectRoute(item) }, item.id == route.id) }
                                 if (onSwitchMovie != null) {

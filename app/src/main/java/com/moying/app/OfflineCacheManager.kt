@@ -11,6 +11,10 @@ import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.job
+import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -35,6 +39,8 @@ internal data class OfflineRecord(
     val bytes: Long = 0L,
     val message: String? = null,
     val updatedAt: Long = 0L,
+    val headers: Map<String, String> = emptyMap(),
+    val sourceEpisode: Episode? = null,
 ) {
     val downloadPercent: Int? get() = progress?.let { (it * 100f).toInt().coerceIn(0, 99) }
 }
@@ -88,6 +94,7 @@ internal class OfflineCacheManager internal constructor(
     @Volatile private var lastPersist = 0L
     private var dirty = false
     @Volatile private var activeDownload: OfflineRecord? = null
+    private var activeResolution: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
 
     private val worker = Thread({
@@ -129,6 +136,8 @@ internal class OfflineCacheManager internal constructor(
                             url = request.url,
                             status = OfflineStatus.QUEUED,
                             updatedAt = System.currentTimeMillis(),
+                            headers = request.episode.headers,
+                            sourceEpisode = request.episode.takeIf { it.resolver != null },
                         )
                         added++
                     }
@@ -244,7 +253,7 @@ internal class OfflineCacheManager internal constructor(
                 routeName,
                 (Playback.FirstEpisode..count).map { number ->
                     val record = byNumber[number]
-                    Episode(number, record?.episodeName ?: "第${number}集", record?.url.orEmpty())
+                    Episode(number, record?.episodeName ?: "第${number}集", record?.url.orEmpty(), record?.headers.orEmpty())
                 },
             )
         }
@@ -256,9 +265,13 @@ internal class OfflineCacheManager internal constructor(
     private fun workerLoop() {
         // JSON is the logical ownership source of truth. In old cache files two
         // records may share a URL/root and different masters may share HLS data.
-        val owners = synchronized(lock) { records.values.map { it.url to it.cacheKey } }
+        val owners = synchronized(lock) {
+            records.values
+                .filter { it.sourceEpisode?.url != it.url || it.bytes > 0L || it.status == OfflineStatus.COMPLETED }
+                .map { OfflineCacheOwner(it.url, it.cacheKey, it.headers) }
+        }
         for (owner in owners) {
-            runCacheMaintenance("Restore offline cache") { cache.restoreOfflineOwners(listOf(owner)) }
+            runCacheMaintenance("Restore offline cache") { cache.restoreOfflineOwnersWithHeaders(listOf(owner)) }
         }
         while (running) {
             val deletes = synchronized(lock) {
@@ -267,7 +280,7 @@ internal class OfflineCacheManager internal constructor(
                 values
             }
             for (record in deletes) {
-                runCacheMaintenance("Delete offline cache") { cache.deleteOffline(record.url, record.cacheKey) }
+                runCacheMaintenance("Delete offline cache") { cache.deleteOffline(record.url, record.cacheKey, record.headers) }
             }
 
             val next = synchronized(lock) { pickNextLocked() }
@@ -332,9 +345,17 @@ internal class OfflineCacheManager internal constructor(
             activeDownload = record
         }
         publish(true)
+        var media = record
+        fun cancelled(): Boolean = synchronized(lock) {
+            !running || key in cancelledKeys || records[key]?.status != OfflineStatus.DOWNLOADING
+        }
         val result = try {
+            if (record.sourceEpisode != null) {
+                val resolved = resolveDownload(record, ::cancelled) ?: throw CancellationException()
+                media = resolved
+            }
             cache.downloadOffline(
-                url = record.url,
+                url = media.url,
                 contentKey = key,
                 onProgress = { progress ->
                     synchronized(lock) {
@@ -349,16 +370,17 @@ internal class OfflineCacheManager internal constructor(
                         publish(now - lastPersist >= 3_000L)
                     }
                 },
-                cancelled = {
-                    synchronized(lock) {
-                        !running || key in cancelledKeys || records[key]?.status != OfflineStatus.DOWNLOADING
-                    }
-                },
+                cancelled = ::cancelled,
                 networkAllowed = ::canDownloadNow,
+                headers = media.headers,
             )
         } catch (interrupted: InterruptedException) {
             Thread.currentThread().interrupt()
             OfflineDownloadResult(cancelled = true)
+        } catch (_: CancellationException) {
+            OfflineDownloadResult(cancelled = true)
+        } catch (failure: PlaybackResolutionException) {
+            OfflineDownloadResult(error = failure.message ?: "无法解析这条缓存线路")
         } catch (failure: Exception) {
             Log.w("Moying-OfflineQueue", "Download failed (${failure.javaClass.simpleName})")
             val message = when (failure) {
@@ -369,11 +391,11 @@ internal class OfflineCacheManager internal constructor(
         } finally {
             activeDownload = null
         }
-        val savedBytes = runCatching { cache.offlineBytes(record.url, key) }.getOrNull()
+        val savedBytes = runCatching { cache.offlineBytes(media.url, key, media.headers) }.getOrNull()
         val now = System.currentTimeMillis()
         synchronized(lock) {
             val current = records[key]
-            if (current != null && current.url == record.url) {
+            if (current != null && current.url == media.url && current.headers == media.headers) {
                 val bytes = savedBytes ?: current.bytes
                 records[key] = when {
                     current.status != OfflineStatus.DOWNLOADING -> current.copy(bytes = bytes, updatedAt = now)
@@ -408,6 +430,39 @@ internal class OfflineCacheManager internal constructor(
         wake()
     }
 
+    private fun resolveDownload(record: OfflineRecord, cancelled: () -> Boolean): OfflineRecord? {
+        val source = record.sourceEpisode ?: return record
+        val episode = runBlocking {
+            val job = coroutineContext.job
+            synchronized(lock) {
+                if (cancelled()) return@runBlocking null
+                activeResolution = job
+            }
+            try {
+                resolvePlaybackEpisode(source)
+            } finally {
+                synchronized(lock) {
+                    if (activeResolution === job) activeResolution = null
+                }
+            }
+        } ?: return null
+        val changed = record.url != episode.url || record.headers != episode.headers
+        val media = synchronized(lock) {
+            if (cancelled()) return null
+            val current = records[record.cacheKey] ?: return null
+            current.copy(url = episode.url, headers = episode.headers, bytes = if (changed) 0L else current.bytes)
+                .also {
+                    records[record.cacheKey] = it
+                    activeDownload = it
+                    if (changed) persistLocked()
+                }
+        }
+        if (changed) runCacheMaintenance("Replace resolved offline cache") {
+            cache.deleteOffline(record.url, record.cacheKey, record.headers)
+        }
+        return media
+    }
+
     private fun publish(persistNow: Boolean) {
         val snapshot = synchronized(lock) { records.values.toList() }
         main.post {
@@ -419,7 +474,12 @@ internal class OfflineCacheManager internal constructor(
     private fun wake() = synchronized(lock) { lock.notifyAll() }
 
     private fun pauseActive(record: OfflineRecord) {
-        if (activeDownload?.cacheKey == record.cacheKey) cache.pauseOffline(record.url, record.cacheKey)
+        val (active, resolution) = synchronized(lock) {
+            val active = activeDownload?.takeIf { it.cacheKey == record.cacheKey } ?: return
+            active to activeResolution
+        }
+        resolution?.cancel()
+        cache.pauseOffline(active.url, active.cacheKey, active.headers)
     }
 
     private fun canDownloadNow(): Boolean {
@@ -450,13 +510,13 @@ internal class OfflineCacheManager internal constructor(
     }
 
     private fun policyChanged() {
-        if (!canDownloadNow()) activeDownload?.let { cache.pauseOffline(it.url, it.cacheKey) }
+        if (!canDownloadNow()) activeDownload?.let(::pauseActive)
         wake()
     }
 
     override fun close() {
         running = false
-        activeDownload?.let { cache.pauseOffline(it.url, it.cacheKey) }
+        activeDownload?.let(::pauseActive)
         networkCallback?.let { runCatching { connectivity.unregisterNetworkCallback(it) } }
         networkCallback = null
         worker.interrupt()
@@ -502,6 +562,8 @@ internal class OfflineCacheManager internal constructor(
         put("episode", episode)
         put("episodeName", episodeName)
         put("url", url)
+        if (headers.isNotEmpty()) put("headers", JSONObject(headers))
+        sourceEpisode?.let { put("sourceEpisode", SourceImport.episodesJson(listOf(it))) }
         put("status", status.name)
         put("bytes", bytes)
         put("message", message.orEmpty())
@@ -556,6 +618,8 @@ internal class OfflineCacheManager internal constructor(
             bytes = optLong("bytes"),
             message = optString("message").takeIf { it.isNotBlank() },
             updatedAt = optLong("updatedAt"),
+            headers = SourceImport.playbackHeaders(optJSONObject("headers")),
+            sourceEpisode = SourceImport.readEpisodes(optJSONArray("sourceEpisode")).firstOrNull()?.takeIf { it.resolver != null },
         ).takeIf { it.cacheKey.isNotBlank() && it.url.isNotBlank() }
     }
 

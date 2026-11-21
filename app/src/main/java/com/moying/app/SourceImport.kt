@@ -44,14 +44,18 @@ private fun cmsCategory(id: String, name: String, parentId: String): SourceCmsCa
     return SourceCmsCategory(key, label, parent)
 }
 
-/** 文本与订阅共用的有限导入器；不加载 Jar、JS、Python 或网页解析接口。 */
+/** 文本与订阅共用的有限导入器；JSON 解析配置只记录 HTTP 请求模板。 */
 internal object SourceImport {
     const val MAX_BYTES = 4 * 1024 * 1024
     const val MAX_MOVIES = 6000
     const val MAX_SOURCES = 120
     private const val MAX_REQUESTS = 8
     private const val MAX_TOTAL_BYTES = 12 * 1024 * 1024
+    private const val RESOLVER_TOKEN = "{url}"
+    private const val URL_PLACEHOLDER = "moying-episode-address-placeholder"
     private val mediaExtensions = listOf(".m3u8", ".mp4", ".m4v", ".webm", ".mov", ".mp3", ".aac", ".ts")
+    private val resolverUrlParameter = Regex("[?&]url=$", RegexOption.IGNORE_CASE)
+    private val resolverResponsePath = Regex("[A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+){0,4}")
 
     fun hash(value: String): String = MessageDigest.getInstance("SHA-256").digest(value.toByteArray())
         .take(12).joinToString("") { "%02x".format(it) }
@@ -64,6 +68,80 @@ internal object SourceImport {
         val path = URI(value).path.orEmpty().lowercase()
         mediaExtensions.any { path.endsWith(it) }
     }.getOrDefault(false)
+
+    fun playbackHeaders(value: Any?): Map<String, String> {
+        val fields = when (value) {
+            is JSONObject -> value
+            is String -> value.takeIf { it.length <= 16_384 }?.let { runCatching { JSONObject(it) }.getOrNull() }
+            else -> null
+        } ?: return emptyMap()
+        val values = fields.keys().asSequence().mapNotNull { name ->
+            (fields.opt(name) as? String)?.let { name to it }
+        }.toMap()
+        return MediaRequestHeaders.normalize(values)
+    }
+
+    fun mergePlaybackHeaders(vararg layers: Map<String, String>): Map<String, String> = buildMap {
+        layers.forEach { putAll(MediaRequestHeaders.normalize(it)) }
+    }
+
+    fun declaredPlaybackHeaders(row: JSONObject): Map<String, String> = mergePlaybackHeaders(
+        playbackHeaders(row.opt("vod_play_header")),
+        playbackHeaders(row.opt("header")),
+        playbackHeaders(row.opt("headers")),
+        playbackHeaders(row.opt("playbackHeaders")),
+    )
+
+    private fun resolverTemplate(value: String): String? {
+        val template = value.trim()
+        if (template.length > 2048 || template.indexOf(RESOLVER_TOKEN) < 0 ||
+            template.indexOf(RESOLVER_TOKEN) != template.lastIndexOf(RESOLVER_TOKEN)
+        ) return null
+        val sample = template.replace(RESOLVER_TOKEN, URL_PLACEHOLDER)
+        if (!validUrl(sample)) return null
+        val uri = URI(sample)
+        return template.takeIf { uri.fragment == null && !uri.rawAuthority.orEmpty().contains(URL_PLACEHOLDER) }
+    }
+
+    fun readPlaybackResolver(row: JSONObject?): PlaybackResolver? {
+        if (row == null) return null
+        val template = resolverTemplate(row.optString("urlTemplate")) ?: return null
+        val urlField = row.optString("urlField", "url").takeIf { it.length <= 100 && resolverResponsePath.matches(it) } ?: return null
+        return PlaybackResolver(template, urlField, playbackHeaders(row.opt("requestHeaders")))
+    }
+
+    fun playbackResolverJson(resolver: PlaybackResolver): JSONObject = JSONObject()
+        .put("urlTemplate", resolver.urlTemplate)
+        .put("urlField", resolver.urlField)
+        .apply {
+            if (resolver.requestHeaders.isNotEmpty()) put("requestHeaders", JSONObject(resolver.requestHeaders))
+        }
+
+    fun readFlagResolvers(row: JSONObject?): Map<String, PlaybackResolver> {
+        if (row == null) return emptyMap()
+        return row.keys().asSequence().take(MAX_SOURCES).mapNotNull { flag ->
+            readPlaybackResolver(row.optJSONObject(flag))?.let { flag to it }
+        }.toMap()
+    }
+
+    private fun tvBoxFlagResolvers(parses: JSONArray?): Map<String, PlaybackResolver> = buildMap {
+        if (parses == null) return@buildMap
+        for (index in 0 until minOf(parses.length(), MAX_SOURCES)) {
+            val row = parses.optJSONObject(index) ?: continue
+            if (row.optInt("type", -1) != 1) continue
+            val ext = row.optJSONObject("ext") ?: continue
+            val flags = ext.optJSONArray("flag") ?: continue
+            val address = row.optString("url").trim()
+            val template = resolverTemplate(if (resolverUrlParameter.containsMatchIn(address)) address + RESOLVER_TOKEN else address) ?: continue
+            val resolver = PlaybackResolver(template, requestHeaders = mergePlaybackHeaders(
+                playbackHeaders(ext.opt("header")), playbackHeaders(row.opt("header")),
+            ))
+            for (flagIndex in 0 until minOf(flags.length(), MAX_SOURCES)) {
+                val flag = (flags.opt(flagIndex) as? String)?.trim().orEmpty()
+                if (size < MAX_SOURCES && flag.isNotEmpty() && flag.length <= 120) putIfAbsent(flag, resolver)
+            }
+        }
+    }
 
     fun clean(value: String): String = Html.fromHtml(value, Html.FROM_HTML_MODE_LEGACY).toString().trim()
 
@@ -170,13 +248,20 @@ internal object SourceImport {
                 val root = JSONObject(text)
                 val sites = root.optJSONArray("sites")
                 if (sites != null) {
+                    val flagResolvers = tvBoxFlagResolvers(root.optJSONArray("parses"))
                     for (i in 0 until sites.length()) {
                         val row = sites.optJSONObject(i)
-                        val type = row?.optInt("type", -1) ?: -1
-                        val api = row?.optString("api").orEmpty()
+                        if (row == null) { batch.skipped++; continue }
+                        val type = row.optInt("type", -1)
+                        val api = row.optString("api")
                         if (type !in listOf(0, 1) || !validUrl(api) || batch.sources.size >= MAX_SOURCES) { batch.skipped++; continue }
-                        val format = row?.optString("format", "cms").takeIf { it == "m3u" } ?: "cms"
-                        batch.sources += TvBoxSource("import:" + hash(sourceKey(api)), clean(row?.optString("name").orEmpty()).ifBlank { URI(api).host }, api, type, from, format)
+                        val format = row.optString("format").takeIf { it == "m3u" } ?: "cms"
+                        batch.sources += TvBoxSource(
+                            "import:" + hash(sourceKey(api)), clean(row.optString("name")).ifBlank { URI(api).host }, api, type, from, format,
+                            playbackHeaders = declaredPlaybackHeaders(row),
+                            playbackResolver = if (format == "cms") readPlaybackResolver(row.optJSONObject("playbackResolver")) else null,
+                            playbackResolversByFlag = if (format == "cms") flagResolvers else emptyMap(),
+                        )
                     }
                 }
                 // 多仓订阅仅递归有限个配置；不能执行的 Spider 站点会明确计入跳过数。
@@ -244,13 +329,16 @@ internal object SourceImport {
     fun titleFromUrl(url: String): String = runCatching { Uri.decode(URI(url).path.substringAfterLast('/')).substringBeforeLast('.') }
         .getOrDefault("").ifBlank { "导入媒体" }.take(120)
 
-    fun directMovie(title: String, url: String, origin: String = "", poster: String = "", genre: String = ""): JSONObject =
+    fun directMovie(
+        title: String, url: String, origin: String = "", poster: String = "", genre: String = "",
+        headers: Map<String, String> = emptyMap(),
+    ): JSONObject =
         JSONObject().put("id", "user:" + hash(url)).put("title", clean(title).ifBlank { "导入媒体" }).put("category", "电影")
             .put("poster", poster).put("genres", genre).put("credit", origin).put("status", "可直接播放")
-            .put("episodes", JSONArray().put(JSONObject().put("name", "正片").put("url", url)))
+            .put("episodes", episodesJson(listOf(Episode(1, "正片", url, headers))))
 
     /** 支持 EXTINF 频道名、台标、分组；TXT 只按第一个逗号切开，保留 URL 中的逗号。 */
-    fun playlistRows(text: String, origin: String): Pair<List<JSONObject>, Int> {
+    fun playlistRows(text: String, origin: String, headers: Map<String, String> = emptyMap()): Pair<List<JSONObject>, Int> {
         val rows = mutableListOf<JSONObject>()
         var skipped = 0
         var name = ""
@@ -279,52 +367,83 @@ internal object SourceImport {
             val title = if (validUrl(line)) name.ifBlank { titleFromUrl(resolved) } else line.substringBefore(',').trim().ifBlank { name }
             if (rows.size < MAX_MOVIES) {
                 val category = clean(group).ifBlank { "电影" }
-                rows += directMovie(title, resolved, origin, poster).put("category", category)
+                rows += directMovie(title, resolved, origin, poster, headers = headers).put("category", category)
             } else skipped++
             name = ""; poster = ""
         }
         return rows to skipped
     }
 
-    /** CMS 多线路逐条过滤网页解析地址；保留所有可播放线路，集数最多的作为默认线路。 */
-    fun cmsRoutes(row: JSONObject): List<PlaybackRoute> {
+    /** 保留 CMS 直链和已经配置解析接口的 HTTP(S) 剧集。 */
+    fun cmsRoutes(row: JSONObject, source: TvBoxSource? = null): List<PlaybackRoute> {
         val from = row.optString("vod_play_from").split("$$$")
+        val headers = mergePlaybackHeaders(source?.playbackHeaders.orEmpty(), declaredPlaybackHeaders(row))
         return row.optString("vod_play_url").split("$$$").mapIndexedNotNull { index, raw ->
+            val flag = from.getOrNull(index).orEmpty().trim()
+            val configuredResolver = source?.playbackResolversByFlag?.get(flag) ?: source?.playbackResolver
             val episodes = raw.split('#').mapNotNull { part ->
                 val cut = part.indexOf('$')
                 val url = (if (cut >= 0) part.substring(cut + 1) else part).trim()
-                if (!mediaUrl(url)) null else (if (cut > 0) clean(part.substring(0, cut)) else "正片") to url
-            }.distinctBy { it.second }.mapIndexed { i, (name, url) -> Episode(i + 1, name, url) }
-            if (episodes.isEmpty()) null else PlaybackRoute("route:$index", clean(from.getOrNull(index).orEmpty()).ifBlank { "线路 ${index + 1}" }, episodes)
+                val direct = mediaUrl(url)
+                if (!direct && (configuredResolver == null || !validUrl(url))) return@mapNotNull null
+                val name = if (cut > 0) clean(part.substring(0, cut)) else "正片"
+                Episode(0, name, url, headers, if (direct) null else configuredResolver)
+            }.distinctBy { it.url }.mapIndexed { i, episode -> episode.copy(number = i + 1) }
+            if (episodes.isEmpty()) null else PlaybackRoute("route:$index", clean(flag).ifBlank { "线路 ${index + 1}" }, episodes)
         }.sortedByDescending { it.episodes.size }
     }
 
     fun readRoutes(row: JSONObject): List<PlaybackRoute> {
+        val headers = declaredPlaybackHeaders(row)
+        val resolver = declaredResolver(row)
         val array = row.optJSONArray("routes")
         val routes = if (array != null) (0 until array.length()).mapNotNull { i ->
             val route = array.optJSONObject(i) ?: return@mapNotNull null
-            val episodes = readEpisodes(route.optJSONArray("episodes"))
+            val episodes = readEpisodes(
+                route.optJSONArray("episodes"),
+                mergePlaybackHeaders(headers, declaredPlaybackHeaders(route)),
+                declaredResolver(route) ?: resolver,
+            )
             if (episodes.isEmpty()) null else PlaybackRoute(route.optString("id", "route:$i"), route.optString("name", "线路 ${i + 1}"), episodes)
         } else emptyList()
-        return routes.ifEmpty { readEpisodes(row.optJSONArray("episodes")).takeIf { it.isNotEmpty() }?.let { listOf(PlaybackRoute("default", "默认线路", it)) }.orEmpty() }
+        return routes.ifEmpty {
+            readEpisodes(row.optJSONArray("episodes"), headers, resolver).takeIf { it.isNotEmpty() }
+                ?.let { listOf(PlaybackRoute("default", "默认线路", it)) }.orEmpty()
+        }
     }
 
-    private fun readEpisodes(array: JSONArray?): List<Episode> = if (array == null) emptyList() else (0 until array.length()).mapNotNull { i ->
+    private fun declaredResolver(row: JSONObject): PlaybackResolver? =
+        readPlaybackResolver(row.optJSONObject("playbackResolver")) ?: readPlaybackResolver(row.optJSONObject("resolver"))
+
+    fun readEpisodes(
+        array: JSONArray?, headers: Map<String, String> = emptyMap(), resolver: PlaybackResolver? = null,
+    ): List<Episode> = if (array == null) emptyList() else (0 until array.length()).mapNotNull { i ->
         val track = array.optJSONObject(i) ?: return@mapNotNull null
         val url = track.optString("url")
-        if (!validUrl(url)) null else track.optString("name", "第 ${i + 1} 集") to url
-    }.distinctBy { it.second }.mapIndexed { i, (name, url) -> Episode(i + 1, name, url) }
+        if (!validUrl(url)) return@mapNotNull null
+        Episode(0, track.optString("name", "第 ${i + 1} 集"), url,
+            mergePlaybackHeaders(headers, declaredPlaybackHeaders(track)), declaredResolver(track) ?: resolver)
+    }.distinctBy { it.url }.mapIndexed { i, episode -> episode.copy(number = i + 1) }
 
     fun routesJson(routes: List<PlaybackRoute>): JSONArray = JSONArray().apply {
         routes.forEach { put(JSONObject().put("id", it.id).put("name", it.name).put("episodes", episodesJson(it.episodes))) }
     }
-    fun episodesJson(episodes: List<Episode>): JSONArray = JSONArray().apply { episodes.forEach { put(JSONObject().put("name", it.name).put("url", it.url)) } }
+    fun episodesJson(episodes: List<Episode>): JSONArray = JSONArray().apply {
+        episodes.forEach { episode ->
+            put(JSONObject().put("name", episode.name).put("url", episode.url).apply {
+                if (episode.headers.isNotEmpty()) put("headers", JSONObject(episode.headers))
+                episode.resolver?.let { put("resolver", playbackResolverJson(it)) }
+            })
+        }
+    }
 
-    fun normalizeMovie(row: JSONObject, id: String = "", category: String = "电影", origin: String = ""): JSONObject? {
+    fun normalizeMovie(row: JSONObject, id: String = "", category: String = "电影", origin: String = "", source: TvBoxSource? = null): JSONObject? {
         val cms = row.has("vod_name") || row.has("vod_play_url")
         val title = clean(if (cms) row.optString("vod_name") else row.optString("title", row.optString("name")))
-        val routes = if (cms) cmsRoutes(row) else readRoutes(row).ifEmpty {
-            row.optString("url").takeIf { validUrl(it) }?.let { listOf(PlaybackRoute("default", "默认线路", listOf(Episode(1, "正片", it)))) }.orEmpty()
+        val routes = if (cms) cmsRoutes(row, source) else readRoutes(row).ifEmpty {
+            val url = row.optString("url").takeIf(::validUrl) ?: return null
+            val episode = Episode(1, "正片", url, declaredPlaybackHeaders(row), declaredResolver(row))
+            listOf(PlaybackRoute("default", "默认线路", listOf(episode)))
         }
         if (title.isBlank() || routes.isEmpty()) return null
         val default = routes.first().episodes

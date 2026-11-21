@@ -69,12 +69,19 @@ internal class IntroAudioExtractor(context: Context) {
         url: String,
         budget: IntroAudioScanBudget,
         onPcm: (ByteBuffer, Int, Int, Long) -> Unit,
+    ) = scan(url, budget, emptyMap(), onPcm)
+
+    fun scan(
+        url: String,
+        budget: IntroAudioScanBudget,
+        headers: Map<String, String>,
+        onPcm: (ByteBuffer, Int, Int, Long) -> Unit,
     ) {
         budget.check()
         try {
             val uri = Uri.parse(url)
             when (uri.scheme?.lowercase()) {
-                "http", "https" -> scanNetwork(url, budget, onPcm)
+                "http", "https" -> scanNetwork(url, budget, MediaRequestHeaders.normalize(headers), onPcm)
                 "content" -> decode(budget, false, onPcm) { it.setDataSource(app, uri, null) }
                 "file", null -> {
                     val file = File(uri.path.orEmpty())
@@ -97,21 +104,26 @@ internal class IntroAudioExtractor(context: Context) {
         }
     }
 
-    private fun scanNetwork(url: String, budget: IntroAudioScanBudget, onPcm: (ByteBuffer, Int, Int, Long) -> Unit) {
+    private fun scanNetwork(
+        url: String,
+        budget: IntroAudioScanBudget,
+        headers: Map<String, String>,
+        onPcm: (ByteBuffer, Int, Int, Long) -> Unit,
+    ) {
         val network = ScanNetwork(budget)
-        val probe = network.probe(url)
+        val probe = network.probe(url, headers)
         val playlist = probe.playlist
         if (playlist != null) {
             val file = File.createTempFile("intro-audio-", ".media", app.cacheDir)
             try {
-                downloadHlsPrefix(probe.url, playlist, file, network, budget)
+                downloadHlsPrefix(probe.url, playlist, probe.headers, file, network, budget)
                 decodeFile(file, budget, true, onPcm)
             } finally {
                 file.delete()
             }
         } else {
             val totalBytes = probe.totalBytes ?: throw IntroAudioScanException("片源不支持分段读取，无法在限额内识别片头。")
-            NetworkMediaDataSource(probe.url, totalBytes, network).use { source ->
+            NetworkMediaDataSource(probe.url, totalBytes, network, probe.headers).use { source ->
                 try {
                     decode(budget, false, onPcm) { it.setDataSource(source) }
                 } finally {
@@ -232,23 +244,26 @@ internal class IntroAudioExtractor(context: Context) {
     private fun downloadHlsPrefix(
         initialUrl: String,
         firstPlaylist: String,
+        initialHeaders: Map<String, String>,
         file: File,
         network: ScanNetwork,
         budget: IntroAudioScanBudget,
     ) {
         var url = initialUrl
         var text = firstPlaylist
+        var headers = initialHeaders
         repeat(3) {
             budget.check()
             val lines = text.lineSequence().map(String::trim).filter(String::isNotEmpty).toList()
             val variant = chooseVariant(url, lines)
             if (variant == null) {
-                downloadResources(mediaPrefix(url, lines), file, network, budget)
+                downloadResources(mediaPrefix(url, lines), file, network, budget, headers)
                 return
             }
-            val next = network.playlist(variant)
-            url = next.first
-            text = next.second
+            val next = network.playlist(variant, headers)
+            url = next.url
+            text = next.text
+            headers = next.headers
         }
         throw IntroAudioScanException("HLS 播放列表层级过多，无法识别片头。")
     }
@@ -258,9 +273,10 @@ internal class IntroAudioExtractor(context: Context) {
         file: File,
         network: ScanNetwork,
         budget: IntroAudioScanBudget,
+        headers: Map<String, String>,
     ) {
         if (resources.size == 1) {
-            file.outputStream().use { network.download(resources.single(), it) }
+            file.outputStream().use { network.download(resources.single(), it, headers) }
             return
         }
         // Keep a small window in flight and append finished parts in playlist order.
@@ -281,7 +297,7 @@ internal class IntroAudioExtractor(context: Context) {
                         if (stopped) throw CancellationException("已取消片头识别")
                         part.outputStream()
                     }
-                    output.use { network.download(resource, it) }
+                output.use { network.download(resource, it, headers) }
                 } finally {
                     synchronized(directory) {
                         if (stopped) {
@@ -464,12 +480,20 @@ internal class IntroAudioExtractor(context: Context) {
         private val episodeBytes = AtomicLong()
         private val keys = ConcurrentHashMap<Int, ByteArray>()
 
-        data class Probe(val url: String, val playlist: String?, val totalBytes: Long?, val incompletePlaylist: Boolean = false)
+        data class Probe(
+            val url: String,
+            val playlist: String?,
+            val totalBytes: Long?,
+            val headers: Map<String, String>,
+            val incompletePlaylist: Boolean = false,
+        )
+        data class Playlist(val url: String, val text: String, val headers: Map<String, String>)
         private data class ResponseRange(val start: Long, val end: Long, val total: Long?)
 
         fun check() = budget.check()
 
-        fun probe(url: String): Probe = open(url, "片源入口", 0L..(ProbeBytes - 1L)) { connection ->
+        fun probe(url: String, headers: Map<String, String>): Probe =
+            open(url, "片源入口", headers, 0L..(ProbeBytes - 1L)) { connection, effectiveHeaders ->
             val partial = connection.responseCode == HttpURLConnection.HTTP_PARTIAL
             val range = if (partial) responseRange(connection, 0L..(ProbeBytes - 1L)) else null
             val prefix = ByteArrayOutputStream(ProbeBytes)
@@ -490,26 +514,27 @@ internal class IntroAudioExtractor(context: Context) {
                 }
                 val text = if (manifest) prefix.toString(Charsets.UTF_8.name()) else null
                 val incomplete = manifest && range != null && (range.total?.let { it > range.end + 1L } ?: true)
-                Probe(connection.url.toString(), text, range?.total, incomplete)
+                Probe(connection.url.toString(), text, range?.total, effectiveHeaders, incomplete)
             }
         }.let { probe ->
             if (probe.incompletePlaylist) {
-                val (url, playlist) = playlist(probe.url)
-                Probe(url, playlist, null)
+                val next = playlist(probe.url, probe.headers)
+                Probe(next.url, next.text, null, next.headers)
             } else probe
         }
 
-        fun playlist(url: String): Pair<String, String> = open(url, "HLS 清单") { connection ->
+        fun playlist(url: String, headers: Map<String, String>): Playlist =
+            open(url, "HLS 清单", headers) { connection, effectiveHeaders ->
             val output = ByteArrayOutputStream()
             connection.inputStream.use { copy(it, output, ManifestBytes, null) }
             val text = output.toString(Charsets.UTF_8.name()).trimStart('\ufeff', ' ', '\r', '\n', '\t')
             if (!text.startsWith("#EXTM3U")) throw IntroAudioScanException("片源返回了无效的 HLS 播放列表。")
-            connection.url.toString() to text
+            Playlist(connection.url.toString(), text, effectiveHeaders)
         }
 
-        fun download(resource: Resource, output: FileOutputStream) {
+        fun download(resource: Resource, output: FileOutputStream, headers: Map<String, String>) {
             val decryption = resource.encryption?.let { encryption ->
-                val key = keys.computeIfAbsent(encryption.declaration) { downloadKey(encryption.keyUrl) }
+                val key = keys.computeIfAbsent(encryption.declaration) { downloadKey(encryption.keyUrl, headers) }
                 val iv = ByteArray(16) { index -> encryption.ivHex.substring(index * 2, index * 2 + 2).toInt(16).toByte() }
                 key to iv
             }
@@ -518,7 +543,7 @@ internal class IntroAudioExtractor(context: Context) {
                 output.channel.truncate(checkpoint)
                 output.channel.position(checkpoint)
             }
-            open(resource.url, "HLS 分片", resource.range, rewind) { connection ->
+            open(resource.url, "HLS 分片", headers, resource.range, rewind) { connection, _ ->
                 val cipher = decryption?.let { (key, iv) ->
                     Cipher.getInstance("AES/CBC/PKCS5Padding").apply {
                         init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
@@ -533,13 +558,13 @@ internal class IntroAudioExtractor(context: Context) {
             }
         }
 
-        private fun downloadKey(url: String): ByteArray {
+        private fun downloadKey(url: String, headers: Map<String, String>): ByteArray {
             // A declaration is used by at least one selected segment or init section, so the
             // segment cap also bounds key requests. Read one extra byte to reject oversized keys.
             val bytes = ByteArray(17)
             if (remaining() < bytes.size) throw scanSizeLimit()
             val count = try {
-                open(url, "HLS 密钥") { connection ->
+                open(url, "HLS 密钥", headers) { connection, _ ->
                     val length = connection.contentLengthLong
                     if (length >= 0L && length != 16L) return@open 0
                     val limit = if (length == 16L) 16 else bytes.size
@@ -564,7 +589,8 @@ internal class IntroAudioExtractor(context: Context) {
             return bytes.copyOf(count)
         }
 
-        fun range(url: String, start: Long, end: Long, length: Long): ByteArray = open(url, "视频字节范围", start..end) { connection ->
+        fun range(url: String, start: Long, end: Long, length: Long, headers: Map<String, String>): ByteArray =
+            open(url, "视频字节范围", headers, start..end) { connection, _ ->
             val actual = responseRange(connection, start..end)
             if (actual.end != end || actual.total != length) throw IntroAudioScanException("片源返回了无效的视频字节范围。")
             val output = ByteArrayOutputStream((end - start + 1L).toInt())
@@ -575,27 +601,34 @@ internal class IntroAudioExtractor(context: Context) {
         private inline fun <T> open(
             raw: String,
             part: String,
+            headers: Map<String, String>,
             range: LongRange? = null,
             rewind: () -> Unit = {},
-            read: (HttpURLConnection) -> T,
+            read: (HttpURLConnection, Map<String, String>) -> T,
         ): T {
             try {
-                return openOnce(raw, range, read)
+                return openOnce(raw, headers, range, read)
             } catch (_: SocketTimeoutException) {
                 budget.check()
                 // Keep transferred bytes charged to the scan, even when discarding a partial response.
                 rewind()
             }
             try {
-                return openOnce(raw, range, read)
+                return openOnce(raw, headers, range, read)
             } catch (_: SocketTimeoutException) {
                 budget.check()
                 throw IntroAudioResponseTimeout(part)
             }
         }
 
-        private inline fun <T> openOnce(raw: String, range: LongRange?, read: (HttpURLConnection) -> T): T {
+        private inline fun <T> openOnce(
+            raw: String,
+            headers: Map<String, String>,
+            range: LongRange?,
+            read: (HttpURLConnection, Map<String, String>) -> T,
+        ): T {
             var url = URL(raw)
+            var effectiveHeaders = headers
             repeat(5) {
                 if (url.protocol !in listOf("http", "https")) throw IntroAudioScanException("片源重定向到了不支持的地址。")
                 val connection = url.openConnection() as HttpURLConnection
@@ -606,17 +639,20 @@ internal class IntroAudioExtractor(context: Context) {
                     connection.useCaches = false
                     connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Android) Moying/1.4")
                     connection.setRequestProperty("Accept-Encoding", "identity")
+                    effectiveHeaders.forEach(connection::setRequestProperty)
                     range?.let { connection.setRequestProperty("Range", "bytes=${it.first}-${it.last}") }
                     val status = connection.responseCode
                     if (status in listOf(301, 302, 303, 307, 308)) {
                         val destination = connection.getHeaderField("Location")
                             ?: throw IntroAudioScanException("片源重定向地址无效。")
-                        url = URL(url, destination)
+                        val target = URL(url, destination)
+                        effectiveHeaders = MediaRequestHeaders.forRedirect(effectiveHeaders, url, target)
+                        url = target
                     } else {
                         if (status != HttpURLConnection.HTTP_OK && status != HttpURLConnection.HTTP_PARTIAL) {
                             throw IntroAudioScanException("片源返回 HTTP $status，无法读取片头音频。")
                         }
-                        return read(connection)
+                        return read(connection, effectiveHeaders)
                     }
                 } finally {
                     connection.disconnect()
@@ -683,6 +719,7 @@ internal class IntroAudioExtractor(context: Context) {
         private val url: String,
         private val length: Long,
         private val network: ScanNetwork,
+        private val headers: Map<String, String>,
     ) : MediaDataSource() {
         private val blocks = object : LinkedHashMap<Long, ByteArray>(4, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, ByteArray>?): Boolean = size > 4
@@ -702,7 +739,7 @@ internal class IntroAudioExtractor(context: Context) {
                     val source = position + copied
                     val start = source / BlockBytes * BlockBytes
                     val block = blocks.getOrPut(start) {
-                        network.range(url, start, start + minOf(BlockBytes.toLong(), length - start) - 1L, length)
+                        network.range(url, start, start + minOf(BlockBytes.toLong(), length - start) - 1L, length, headers)
                     }
                     val insideBlock = (source - start).toInt()
                     val count = minOf(requested - copied, block.size - insideBlock)

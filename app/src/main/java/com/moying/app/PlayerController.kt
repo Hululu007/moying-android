@@ -34,11 +34,17 @@ interface PlayerController {
     /** 真实播放用：指定这一集的地址、续播位置与内容身份键（原始地址不参与缓存键）。 */
     fun setDataSource(url: String, startMillis: Long, contentKey: String) = setDataSource(url, startMillis)
 
+    /** 已声明的回源播放请求头由播放器代理处理。 */
+    fun setDataSource(url: String, startMillis: Long, contentKey: String, headers: Map<String, String>) =
+        setDataSource(url, startMillis, contentKey)
+
     /** 旧实现的兼容钩子；真实播放器同时重写此入口并转发到带键的重载，保留旧调用者。 */
     fun setDataSource(url: String, startMillis: Long) { }
 
     /** 输入：下一集 URL 与内容身份键；输出：后台预准备，空地址取消已有预加载。 */
     fun preload(url: String, contentKey: String) = preload(url)
+
+    fun preload(url: String, contentKey: String, headers: Map<String, String>) = preload(url, contentKey)
 
     /** 旧实现的兼容钩子；真实播放器也保留单参数调用，内部重估预取则始终携带原内容键。 */
     fun preload(url: String) { }

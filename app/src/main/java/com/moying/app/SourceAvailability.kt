@@ -216,9 +216,14 @@ internal object SourceAvailabilityProbe {
             return result(source, started, SourceAvailability.UNSUPPORTED, "未返回兼容的AppleCMS JSON/XML目录")
         }
         if (document.rows.isEmpty()) return result(source, started, SourceAvailability.EMPTY, "接口目录可读，暂无影片样本")
-        val playable = document.rows.count { SourceImport.clean(it.optString("vod_name")).isNotBlank() && SourceImport.cmsRoutes(it).isNotEmpty() }
-        return if (playable > 0) result(source, started, SourceAvailability.AVAILABLE, "接口可读，首页含${playable}部直链影片；未逐片验证播放")
-        else result(source, started, SourceAvailability.UNSUPPORTED, "目录可读，首页样本没有当前版本支持的播放直链")
+        val candidates = document.rows.mapNotNull { row ->
+            if (SourceImport.clean(row.optString("vod_name")).isBlank()) return@mapNotNull null
+            SourceImport.cmsRoutes(row, source).takeIf { it.isNotEmpty() }
+        }
+        if (candidates.isEmpty()) return result(source, started, SourceAvailability.UNSUPPORTED, "目录可读，首页样本没有当前版本支持的播放线路")
+        val hasDeferredEpisodes = candidates.any { routes -> routes.any { route -> route.episodes.any { it.resolver != null } } }
+        val sample = if (hasDeferredEpisodes) "${candidates.size}部影片的线路候选（含待解析）" else "${candidates.size}部直链影片"
+        return result(source, started, SourceAvailability.AVAILABLE, "接口可读，首页含$sample；未逐片验证播放")
     }
 
     private fun failed(source: TvBoxSource, started: Long, error: Exception): SourceCheckResult = when (error) {

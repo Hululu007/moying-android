@@ -32,7 +32,12 @@ private object PlaybackRecoveryTuning {
 
 /** 使用稳定的 Android MediaPlayer 播放网络 MP4/HLS，并保留一个下一集预准备实例。 */
 class AndroidPlayerController(private val context: Context) : PlayerController {
-    private class PreloadedMedia(val url: String, val player: MediaPlayer) {
+    private class PreloadedMedia(
+        val url: String,
+        val contentKey: String,
+        val headers: Map<String, String>,
+        val player: MediaPlayer,
+    ) {
         val startedAt = SystemClock.elapsedRealtime()
         var prepared = false
         var bufferedPercent = 0
@@ -46,7 +51,9 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
     private var holder: SurfaceHolder? = null
     private var source = ""
     private var sourceCacheKey = ""
+    private var sourceHeaders = emptyMap<String, String>()
     private var desiredNextCacheKey = ""
+    private var desiredNextHeaders = emptyMap<String, String>()
     private var prepared = false
     private var hasStarted = false
     private var completed = false
@@ -113,7 +120,7 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
         this.holder = holder
         val current = player
         if (current == null && source.isNotBlank() && errorMessage == null) {
-            runCatching { cache().setCurrent(source, resumePosition, sourceCacheKey) }
+            registerCurrentCache()
             openSource()
         }
         else if (current != null && prepared) {
@@ -154,8 +161,13 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
 
     override fun preload(url: String) = preload(url, ContentCacheKey.fallback(url.trim()))
 
+    override fun setDataSource(url: String, startMillis: Long, contentKey: String) =
+        setDataSource(url, startMillis, contentKey, emptyMap())
+
+    override fun preload(url: String, contentKey: String) = preload(url, contentKey, emptyMap())
+
     /** 输入：媒体 URL、续播毫秒与内容身份键；输出：接管同地址预加载，否则清理旧实例并异步连接。 */
-    override fun setDataSource(url: String, startMillis: Long, contentKey: String) {
+    override fun setDataSource(url: String, startMillis: Long, contentKey: String, headers: Map<String, String>) {
         captureConfirmedProgress()
         sourceGeneration++
         cancelNetworkRecovery()
@@ -165,7 +177,10 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
         automaticRetries = 0
         ensureNetworkCallback()
         val nextSource = url.trim()
-        val warm = preloaded?.takeIf { it.url == nextSource && it.valid }
+        val requestHeaders = MediaRequestHeaders.normalize(headers)
+        val warm = preloaded?.takeIf {
+            it.url == nextSource && it.contentKey == contentKey && it.headers == requestHeaders && it.valid
+        }
         if (warm != null) {
             // 先转移所有权，旧预加载回调随后只会作为当前播放器回调处理。
             preloaded = null
@@ -176,21 +191,24 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
         } else releasePreload()
         desiredNextSource = ""
         desiredNextCacheKey = ""
+        desiredNextHeaders = emptyMap()
         preloadRetryAt = 0L
         preloadFailures = 0
         releasePlayer()
         source = nextSource
         sourceCacheKey = contentKey
+        sourceHeaders = requestHeaders
         resumePosition = startMillis.coerceAtLeast(Playback.Start)
         durationHint = Playback.Start
         errorMessage = null
         playRequested = source.isNotBlank()
         isBuffering = playRequested
         if (source.isBlank()) {
+            streamCache?.releasePlayback()
             errorMessage = "片源地址为空"
             return
         }
-        runCatching { cache().setCurrent(source, resumePosition, sourceCacheKey) }
+        registerCurrentCache()
         if (warm != null) {
             player = warm.player
             bufferedPercent = warm.bufferedPercent
@@ -201,9 +219,10 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
     }
 
     /** 当前集有足够的实际播放余量才建立下一集 native 连接；磁盘角色独立保留。 */
-    override fun preload(url: String, contentKey: String) {
+    override fun preload(url: String, contentKey: String, headers: Map<String, String>) {
         val nextSource = url.trim()
-        if (nextSource.isBlank() || nextSource == source) {
+        val requestHeaders = MediaRequestHeaders.normalize(headers)
+        if (nextSource.isBlank() || (nextSource == source && requestHeaders == sourceHeaders)) {
             releasePreload()
             return
         }
@@ -214,10 +233,11 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
             refreshCacheProgress()
             return
         }
-        if (desiredNextSource != nextSource || desiredNextCacheKey != contentKey) {
+        if (desiredNextSource != nextSource || desiredNextCacheKey != contentKey || desiredNextHeaders != requestHeaders) {
             releasePreload()
             desiredNextSource = nextSource
             desiredNextCacheKey = contentKey
+            desiredNextHeaders = requestHeaders
         }
         syncCacheState()
         if (!playRequested || !isPlaying || isBuffering || holder == null || streamCache?.canPreload() != true) {
@@ -239,14 +259,14 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
             return
         }
         val nextPlayer = runCatching { MediaPlayer() }.getOrNull() ?: return
-        runCatching { cache().setNext(nextSource, contentKey) }
-        val next = PreloadedMedia(nextSource, nextPlayer)
+        runCatching { cache().setNext(nextSource, contentKey, requestHeaders) }
+        val next = PreloadedMedia(nextSource, contentKey, requestHeaders, nextPlayer)
         preloaded = next
         nextPreloadMessage = "下一集预缓冲中"
         runCatching {
             configurePlayer(nextPlayer)
             nextPlayer.setVolume(0f, 0f)
-            nextPlayer.setDataSource(playableUrl(nextSource, contentKey))
+            nextPlayer.setDataSource(playableUrl(nextSource, contentKey, requestHeaders))
             nextPlayer.prepareAsync()
         }.onFailure {
             // 预加载失败不覆盖当前集的播放、缓冲、错误或尺寸状态。
@@ -279,7 +299,7 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
         isBuffering = playRequested
         runCatching {
             configurePlayer(current)
-            current.setDataSource(playableUrl(source, sourceCacheKey))
+            current.setDataSource(playableUrl(source, sourceCacheKey, sourceHeaders))
             current.prepareAsync()
             armNetworkWatchdog(current)
         }.onFailure { if (player === current) fail("片源连接失败，请重试或更换地址", recoverable = it is IOException) }
@@ -439,6 +459,7 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
     }
 
     override fun play() {
+        if (source.isBlank()) return
         ensureNetworkCallback()
         lastAdvanceAt = SystemClock.elapsedRealtime()
         lastObservedPosition = resumePosition
@@ -454,7 +475,7 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
             isBuffering = holder != null
             if (holder != null) {
                 // 闲置回收后代理可能已关闭，重建时先保护当前集并恢复连续缓存角色。
-                runCatching { cache().setCurrent(source, resumePosition, sourceCacheKey) }
+                registerCurrentCache()
                 openSource()
             }
         } else if (prepared) {
@@ -522,7 +543,7 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
             applyPlaybackSpeed(current, speed, keepPaused = !isPlaying)
         } else playbackSpeed = speed
         syncCacheState()
-        if (desiredNextSource.isNotBlank()) preload(desiredNextSource, desiredNextCacheKey)
+        if (desiredNextSource.isNotBlank()) preload(desiredNextSource, desiredNextCacheKey, desiredNextHeaders)
     }
 
     /** 输入：目标倍速及暂停状态；输出：成功更新倍速，拒绝时恢复旧参数并保留正在播放的影片。 */
@@ -561,7 +582,7 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
         captureConfirmedProgress()
         observePlaybackProgress()
         syncCacheState()
-        if (desiredNextSource.isNotBlank()) preload(desiredNextSource, desiredNextCacheKey)
+        if (desiredNextSource.isNotBlank()) preload(desiredNextSource, desiredNextCacheKey, desiredNextHeaders)
         refreshCacheProgress()
         return resumePosition
     }
@@ -736,6 +757,7 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
         if (clearCache) {
             desiredNextSource = ""
             desiredNextCacheKey = ""
+            desiredNextHeaders = emptyMap()
             preloadRetryAt = 0L
             preloadFailures = 0
             nextPreloadMessage = null
@@ -774,6 +796,7 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
         streamCache = null
         source = ""
         sourceCacheKey = ""
+        sourceHeaders = emptyMap()
         desiredNextCacheKey = ""
         holder = null
         resumePosition = Playback.Start
@@ -784,14 +807,21 @@ class AndroidPlayerController(private val context: Context) : PlayerController {
     /** 输入：会话上下文；输出：懒创建回环缓存，异常时使用原始 URL 保留播放兼容性。 */
     private fun cache(): StreamingCacheProxy = streamCache ?: StreamingCacheProxy.get(context.applicationContext).also { streamCache = it }
 
-    private fun playableUrl(url: String, contentKey: String = ""): String =
-        runCatching { cache().proxyUrl(url, contentKey) }.getOrDefault(url)
+    private fun registerCurrentCache() {
+        runCatching { cache().setCurrent(source, resumePosition, sourceCacheKey, sourceHeaders) }
+    }
+
+    private fun playableUrl(url: String, contentKey: String, headers: Map<String, String>): String {
+        val proxied = runCatching { cache().proxyUrl(url, contentKey, headers) }.getOrDefault(url)
+        if (headers.isNotEmpty() && proxied == url) throw IOException("无法准备回源请求")
+        return proxied
+    }
 
     /** 输入：已完成的真实分片/平台缓冲回调；输出：下一集时长与字节，磁盘字节不换算假秒数。 */
     private fun refreshCacheProgress() {
         val next = preloaded
         val address = desiredNextSource.takeIf { it.isNotBlank() } ?: next?.url ?: return
-        val stats = streamCache?.stats(address) ?: StreamCacheStats()
+        val stats = streamCache?.stats(address, desiredNextCacheKey, desiredNextHeaders) ?: StreamCacheStats()
         nextBufferedBytes = stats.bytes
         nextPreloadDuration = maxOf(next?.durationMillis ?: 0L, stats.totalDurationMillis)
         val nativeDuration = if (next?.prepared == true && next.durationMillis > 0L) next.durationMillis * next.bufferedPercent / 100L else 0L

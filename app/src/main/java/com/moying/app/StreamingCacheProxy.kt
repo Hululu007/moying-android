@@ -66,6 +66,8 @@ private object StreamCacheTuning {
     /** 主动缓存连续无进度超过该时长才判定失败，给慢速源留出重试窗口。 */
     const val OfflineIdleMillis = 30_000L
     const val FullRestartLimit = 3
+    const val MaxRedirects = 5
+    val Redirects = setOf(301, 302, 303, 307, 308)
     val ContentRange = Regex("bytes (\\d+)-(\\d+)/(\\d+|\\*)", RegexOption.IGNORE_CASE)
 }
 
@@ -74,13 +76,20 @@ internal data class StreamCacheStats(val durationMillis: Long = 0L, val totalDur
 internal data class OfflineDownloadProgress(val fraction: Float?, val bytes: Long)
 internal data class OfflineDownloadResult(val rootId: String = "", val success: Boolean = false, val cancelled: Boolean = false, val error: String? = null, val waitingForNetwork: Boolean = false)
 
+internal data class OfflineCacheOwner(val url: String, val contentKey: String, val headers: Map<String, String> = emptyMap())
+
 /**
  * 输入：远程媒体地址；输出：仅本应用会话使用的回环 HTTP 地址。
  * 平台 MediaPlayer 继续解码；后台持续写磁盘，播放器读取同一份逐渐增长的文件。
  * HLS 的播放列表、相对分片、AES key 和 init map 均经同一代理，不把媒体装进内存。
  */
 internal class StreamingCacheProxy(context: Context, private val offlinePolicyOverride: (() -> Boolean)? = null) : Closeable {
-    private class Entry(val url: String, val id: String, directory: File) {
+    private data class RequestIdentity(val url: String, val fingerprint: String)
+
+    private class Entry(val request: RequestIdentity, val id: String, directory: File, headers: Map<String, String>?) {
+        val url get() = request.url
+        val hasRequestContext get() = request.fingerprint.isNotEmpty()
+        @Volatile var requestHeaders = headers
         val file = File(directory, "$id.bin")
         val info = File(directory, "$id.properties")
         val signal = Object()
@@ -151,7 +160,7 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     private val directory = File(appContext.filesDir, "video-stream-cache")
     private val legacyCacheDirectory = File(appContext.cacheDir, "video-stream-cache")
     private val network = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-    private val entries = ConcurrentHashMap<String, Entry>()
+    private val entries = ConcurrentHashMap<RequestIdentity, Entry>()
     private val byId = ConcurrentHashMap<String, Entry>()
     private val registration = Any()
     private val playbackSelection = Any()
@@ -216,8 +225,8 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     }
 
     /** 输入：当前集/续播位置与内容身份键；输出：启动当前集连续缓存，已有磁盘数据可复用。 */
-    fun setCurrent(url: String, position: Long, contentKey: String) = synchronized(playbackSelection) {
-        val entry = entry(url, contentKey)
+    fun setCurrent(url: String, position: Long, contentKey: String, headers: Map<String, String> = emptyMap()) = synchronized(playbackSelection) {
+        val entry = entry(url, contentKey, headers)
         current = entry
         positionMillis = position
         nativeBufferedPosition = position
@@ -229,9 +238,9 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     }
 
     /** 输入：下一集地址与内容身份键，空地址取消；输出：满足开关、网络与余量条件后才持续预缓存下一集。 */
-    fun setNext(url: String, contentKey: String = "") = synchronized(playbackSelection) {
-        val candidate = url.takeIf { it.isNotBlank() && it != current?.url && nextPrefetchAllowed() }
-            ?.let { entry(it, contentKey) }
+    fun setNext(url: String, contentKey: String = "", headers: Map<String, String> = emptyMap()) = synchronized(playbackSelection) {
+        val candidate = url.takeIf { it.isNotBlank() && nextPrefetchAllowed() }
+            ?.let { entry(it, contentKey, headers) }?.takeUnless { it === current }
         if (candidate === next) return
         next = candidate
         nextJob?.cancel(true)
@@ -240,9 +249,11 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
         nextJob = candidate?.let { jobs.submit { prefetchLoop(it, true) } }
     }
 
-    fun proxyUrl(url: String, contentKey: String = ""): String =
+    fun proxyUrl(url: String, contentKey: String = "", headers: Map<String, String> = emptyMap()): String =
         if (url.startsWith("http://", true) || url.startsWith("https://", true)) {
-            entry(url, contentKey).let { if (it.bypass && !it.pinned) url else localUrl(it) }
+            entry(url, contentKey, headers).let {
+                if (it.bypass && !it.pinned && !it.hasRequestContext) url else localUrl(it)
+            }
         } else url
 
     /** 输入：播放页释放或换页；输出：只停止播放窗口的缓存，不关闭进程级代理，主动缓存下载不受影响。 */
@@ -259,7 +270,8 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     }
 
     /** 输入：媒体地址；输出：真实缓存字节和 HLS 连续分片时间，不按字节比例伪造时长。 */
-    fun stats(url: String): StreamCacheStats = entries[url]?.let { stats(it, 0) } ?: StreamCacheStats()
+    fun stats(url: String, contentKey: String = "", headers: Map<String, String> = emptyMap()): StreamCacheStats =
+        findEntry(url, contentKey, headers)?.let { stats(it, 0) } ?: StreamCacheStats()
 
     /** 输入：无；输出：与播放缓存共用的总容量上限，供管理页展示。 */
     fun capacityBytes(): Long = StreamCacheTuning.BudgetBytes
@@ -274,40 +286,71 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
             val url = properties.getProperty("sourceUrl")?.takeIf { it.isNotBlank() } ?: return@forEach
             val id = file.nameWithoutExtension.substringBefore("-range-")
             if (ContentCacheKey.isLegacyId(id)) return@forEach
-            registerEntry(url, id).pinned = true
+            val fingerprint = properties.getProperty("requestFingerprint").orEmpty()
+            val headers = emptyMap<String, String>().takeIf { fingerprint.isEmpty() }
+            registerEntry(RequestIdentity(url, fingerprint), id, headers).pinned = true
         }
     }
 
-    private fun entry(url: String, contentKey: String? = null): Entry =
-        findOrRegisterEntry(url) { contentKey?.takeIf { it.isNotBlank() } ?: ContentCacheKey.fallback(url) }
+    private fun rootCacheId(request: RequestIdentity, contentKey: String): String {
+        val base = contentKey.ifBlank { ContentCacheKey.fallback(request.url) }
+        return if (request.fingerprint.isEmpty()) base else ContentCacheKey.root(base, request.fingerprint, 0)
+    }
+
+    private fun entry(url: String, contentKey: String, headers: Map<String, String> = emptyMap()): Entry {
+        val normalized = MediaRequestHeaders.normalize(headers)
+        val request = RequestIdentity(url, MediaRequestHeaders.fingerprint(normalized))
+        return findOrRegisterEntry(request, normalized) { rootCacheId(request, contentKey) }
+    }
 
     /** 输入：父条目与 HLS 子清单/分片地址；输出：叠加变体标识的独立缓存条目。 */
-    private fun childEntry(parent: Entry, url: String): Entry =
-        findOrRegisterEntry(url, parent.pinned) { ContentCacheKey.child(parent.id, url) }
+    private fun childEntry(parent: Entry, url: String, headers: Map<String, String>): Entry {
+        val fingerprint = if (headers == parent.requestHeaders) parent.request.fingerprint
+            else "redirected-${parent.request.fingerprint}"
+        return findOrRegisterEntry(RequestIdentity(url, fingerprint), headers, parent.pinned) {
+            ContentCacheKey.child(parent.id, url)
+        }
+    }
 
-    private inline fun findOrRegisterEntry(url: String, retain: Boolean = false, preferredId: () -> String): Entry = synchronized(registration) {
-        val value = entries[url] ?: (
+    private inline fun findOrRegisterEntry(
+        request: RequestIdentity,
+        headers: Map<String, String>,
+        retain: Boolean = false,
+        preferredId: () -> String,
+    ): Entry = synchronized(registration) {
+        val value = entries[request] ?: (
             // Recover URL-shared files written by the previous release.
-            byId.values.firstOrNull { restored -> restored.url == url && restored.pinned }
-                ?: registerEntry(url, preferredId())
-            ).also { entries[url] = it }
+            byId.values.firstOrNull { restored -> restored.request == request && restored.pinned }
+                ?: registerEntry(request, preferredId(), headers)
+            ).also { entries[request] = it }
+        if (value.requestHeaders == null) value.requestHeaders = headers
         if (retain) value.deleteWhenUnused = false
         value
     }
 
     /** 输入：回源地址与期望键；输出：同键已被其它地址占用时追加后缀，避免两个回源共用同一份文件。 */
-    private fun registerEntry(url: String, preferredId: String): Entry {
+    private fun registerEntry(request: RequestIdentity, preferredId: String, headers: Map<String, String>?): Entry {
         synchronized(registration) {
             var id = preferredId
             var attempt = 0
             while (true) {
                 val existing = byId[id]
-                if (existing == null || existing.url == url) break
+                if (existing == null || existing.request == request) break
                 attempt++
                 id = "$preferredId-$attempt"
             }
-            return byId[id] ?: Entry(url, id, directory).also { byId[id] = it }
+            return byId[id] ?: Entry(request, id, directory, headers).also { byId[id] = it }
         }
+    }
+
+    private fun findEntry(url: String, contentKey: String, headers: Map<String, String>): Entry? {
+        val normalized = MediaRequestHeaders.normalize(headers)
+        val request = RequestIdentity(url, MediaRequestHeaders.fingerprint(normalized))
+        val value = offlineRoots[contentKey]?.takeIf { it.request == request }
+            ?: entries[request]
+            ?: byId[rootCacheId(request, contentKey)]?.takeIf { it.request == request }
+        if (value != null && value.requestHeaders == null) value.requestHeaders = normalized
+        return value
     }
     private fun localUrl(value: Entry) = "http://127.0.0.1:${server.localPort}/${value.id}/media${if (value.url.contains(".m3u", true)) ".m3u8" else ".bin"}"
     private fun online() = runCatching { network.activeNetwork != null }.getOrDefault(false)
@@ -615,12 +658,14 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
             val prefix = if (refresh) 0L else value.available
             // 播放预取沿用 Range 探测，主动缓存也接受从头发送的完整响应。
             val probeRange = prefix == 0L && !refresh && value.manifest == null && !value.auxiliary
-            connection = open(value.url, when {
+            connection = open(value, when {
                 prefix > 0L -> prefix
                 probeRange -> 0L
                 else -> null
-            }, null, value.validator)
-            value.connection = connection
+            }, null, value.validator, onOpen = { opened ->
+                value.connection = opened
+                if (value.epoch != epoch || !needed(value)) throw IOException("Media request cancelled")
+            }, onClose = { value.connection = null })
             if (value.epoch != epoch || !needed(value)) return
             val status = connection.responseCode
             val responseValidator = connection.getHeaderField("ETag")?.takeUnless { it.startsWith("W/") }
@@ -660,7 +705,8 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
                     }
                 }
                 if (!offline && probeRange && status != HttpURLConnection.HTTP_PARTIAL && !isManifest) {
-                    // 源忽略 Range：不写任何前缀，直接让整条地址直连，避免先下前缀再放弃。
+                    // No Range support. Retain the total for suffix requests through the header-aware relay.
+                    if (value.hasRequestContext) value.length = connection.contentLengthLong
                     abandon(value)
                     return
                 }
@@ -862,6 +908,7 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
             // 原始地址仅作为回源元数据保存，不参与缓存键。
             setProperty("sourceUrl", value.url)
             setProperty("sourcePath", ContentCacheKey.sourcePath(value.url))
+            if (value.hasRequestContext) setProperty("requestFingerprint", value.request.fingerprint)
             setProperty("savedAt", value.savedAt.toString())
             setProperty("pinned", value.pinned.toString())
             value.offlineVariantId?.let { setProperty("offlineVariantId", it) }
@@ -870,6 +917,10 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     }
 
     private fun parseManifest(value: Entry, text: String, base: String): Manifest {
+        val manifestHeaders = checkNotNull(value.requestHeaders)
+        // Relative and absolute children inherit the headers actually permitted on this playlist.
+        val childHeaders = if (manifestHeaders.isEmpty()) manifestHeaders
+            else MediaRequestHeaders.forRedirect(manifestHeaders, URL(value.url), URL(base))
         val segments = mutableListOf<Segment>()
         val variants = mutableListOf<Entry>()
         val resources = mutableListOf<Entry>()
@@ -887,7 +938,7 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
         fun resolve(raw: String): Entry? {
             val resolved = runCatching { URI(base).resolve(raw).toString() }.getOrNull() ?: return null
             if (!resolved.startsWith("http://", true) && !resolved.startsWith("https://", true)) return null
-            return childEntry(value, resolved).also { it.roles = it.roles or value.roles }
+            return childEntry(value, resolved, childHeaders).also { it.roles = it.roles or value.roles }
         }
         for (raw in text.lineSequence()) {
             var line = raw.trim()
@@ -982,9 +1033,10 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
         onProgress: (OfflineDownloadProgress) -> Unit = {},
         cancelled: () -> Boolean = { false },
         networkAllowed: () -> Boolean = ::offlineAllowed,
+        headers: Map<String, String> = emptyMap(),
     ): OfflineDownloadResult {
         val root = synchronized(playbackSelection) {
-            entry(url, contentKey).also { value ->
+            entry(url, contentKey, headers).also { value ->
                 offlineRoots[contentKey] = value
                 collectTree(value).forEach { it.deleteWhenUnused = false }
                 markOffline(value)
@@ -1036,18 +1088,21 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     }
 
     /** 输入：根条目；输出：暂停时立即停止所有分支的下载任务，已落盘前缀保留供续传。 */
-    fun pauseOffline(url: String, contentKey: String) {
+    fun pauseOffline(url: String, contentKey: String, headers: Map<String, String> = emptyMap()) {
         offlinePolicyCheckedAt = 0L
-        val root = entries[url] ?: byId[contentKey] ?: return
+        val root = findEntry(url, contentKey, headers) ?: return
         stopOfflineTree(root)
         saveInfoSafely(root)
     }
 
     /** Restore logical ownership from the existing queue file, including older URL-shared downloads. */
-    fun restoreOfflineOwners(owners: List<Pair<String, String>>) {
+    fun restoreOfflineOwners(owners: List<Pair<String, String>>) =
+        restoreOfflineOwnersWithHeaders(owners.map { (url, key) -> OfflineCacheOwner(url, key) })
+
+    fun restoreOfflineOwnersWithHeaders(owners: List<OfflineCacheOwner>) {
         initialized.await()
-        owners.forEach { (url, key) ->
-            val root = entry(url, key)
+        owners.forEach { (url, key, headers) ->
+            val root = entry(url, key, headers)
             offlineRoots[key] = root
             restoreTree(root).forEach { value ->
                 value.pinned = true
@@ -1071,8 +1126,9 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     }
 
     /** Release one record; shared HLS resources and active playback remain available. */
-    fun deleteOffline(url: String, contentKey: String): Long {
-        val root = offlineRoots.remove(contentKey) ?: runCatching { entry(url, contentKey) }.getOrNull() ?: return 0L
+    fun deleteOffline(url: String, contentKey: String, headers: Map<String, String> = emptyMap()): Long {
+        val root = entry(url, contentKey, headers)
+        offlineRoots.remove(contentKey, root)
         val candidates = restoreTree(root)
         val retained = offlineRoots.values.distinct().flatMap { restoreTree(it) }.toSet()
         candidates.filter { it !in retained }.forEach { value ->
@@ -1117,7 +1173,7 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
                         } else if (file.exists()) removedAll = false
                     }
                     if (!removedAll) return@reclaim
-                    entries.remove(value.url, value)
+                    entries.remove(value.request, value)
                     byId.remove(value.id, value)
                 }
             }
@@ -1126,8 +1182,8 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     }
 
     /** 输入：根条目；输出：已完成主动缓存在磁盘上的实际占用。 */
-    fun offlineBytes(url: String, contentKey: String): Long {
-        val root = entries[url] ?: byId[contentKey] ?: return 0L
+    fun offlineBytes(url: String, contentKey: String, headers: Map<String, String> = emptyMap()): Long {
+        val root = findEntry(url, contentKey, headers) ?: return 0L
         return directory.listFiles()?.filter { file ->
             val base = file.nameWithoutExtension.substringBefore("-range-")
             file.extension == "bin" && (base == root.id || base.startsWith("${root.id}-"))
@@ -1135,8 +1191,8 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     }
 
     /** 输入：根条目；输出：主动缓存是否完整可离线播放。 */
-    fun offlineReady(url: String, contentKey: String): Boolean {
-        val root = entries[url] ?: byId[contentKey] ?: return false
+    fun offlineReady(url: String, contentKey: String, headers: Map<String, String> = emptyMap()): Boolean {
+        val root = findEntry(url, contentKey, headers) ?: return false
         initialize(root)
         return offlineTreeComplete(root)
     }
@@ -1352,6 +1408,7 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     private fun awaitReady(value: Entry): Boolean {
         val deadline = System.currentTimeMillis() + StreamCacheTuning.RequestWaitMillis
         while (!closed && !Thread.currentThread().isInterrupted && System.currentTimeMillis() < deadline) {
+            if (value.bypass && !value.pinned) return false
             if (value.initialized && (value.manifest != null || value.available > 0L || value.length >= 0L)) return true
             ensure(value)
             synchronized(value.signal) { value.signal.wait(StreamCacheTuning.WaitMillis) }
@@ -1388,8 +1445,11 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
                 if (value.roles == 2 && !value.pinned && !allowedNext()) {
                     respond(output, 503, mapOf("Retry-After" to "1", "Content-Length" to "0")); return
                 }
-                if (closed || (value.roles == 0 && !value.pinned)) return
-                if (value.bypass && !value.pinned) { respond(output, 302, mapOf("Location" to value.url, "Content-Length" to "0")); return }
+                if (closed || (value.roles == 0 && !value.pinned) || value.requestHeaders == null) return
+                if (value.bypass && !value.pinned && !value.hasRequestContext) {
+                    upstreamFailure(value, output)
+                    return
+                }
                 initialize(value)
                 val earlyRange = Regex("bytes=(\\d+)-(\\d*)").matchEntire(headers["range"].orEmpty())
                 val earlyStart = earlyRange?.groupValues?.get(1)?.toLongOrNull()
@@ -1406,7 +1466,12 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
                 }
                 if (value.prefixSuppressed && (earlyStart == null || earlyStart <= value.available)) value.prefixSuppressed = false
                 ensure(value)
-                if (!awaitReady(value)) { respond(output, 302, mapOf("Location" to value.url, "Content-Length" to "0")); return }
+                val ready = awaitReady(value)
+                val uncached = value.bypass && !value.pinned && value.hasRequestContext
+                if (!ready && !uncached) {
+                    upstreamFailure(value, output)
+                    return
+                }
                 val manifest = value.manifest
                 if (manifest != null) {
                     // 主动缓存的 master 清单只保留已下载的变体和音轨，断网时播放器不会去取未缓存的分片。
@@ -1421,10 +1486,15 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
                 val endText = range?.groupValues?.get(2).orEmpty()
                 val start = if (range != null && suffix.isEmpty() && value.length > 0) (value.length - (endText.toLongOrNull() ?: 0L)).coerceAtLeast(0L) else suffix.toLongOrNull() ?: 0L
                 val end = if (range != null && suffix.isNotEmpty()) endText.toLongOrNull() else null
-                if ((end != null && end < start) || (range != null && suffix.isEmpty() && (endText.toLongOrNull() ?: 0L) <= 0L)) {
+                if ((end != null && end < start) ||
+                    (range != null && suffix.isEmpty() && ((endText.toLongOrNull() ?: 0L) <= 0L || uncached && value.length <= 0L))) {
                     val invalidRange = mutableMapOf("Content-Length" to "0")
                     if (value.length >= 0L) invalidRange["Content-Range"] = "bytes */${value.length}"
                     respond(output, 416, invalidRange)
+                    return
+                }
+                if (uncached) {
+                    relayDirect(value, output, start, end, request[0] == "HEAD", true)
                     return
                 }
                 if (start > value.available || (value.limited && start >= value.available)) {
@@ -1475,7 +1545,7 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     }
 
     private fun respond(output: OutputStream, status: Int, headers: Map<String, String>) {
-        val reason = when (status) { 206 -> "Partial Content"; 302 -> "Found"; 416 -> "Range Not Satisfiable"; 503 -> "Service Unavailable"; else -> "OK" }
+        val reason = when (status) { 206 -> "Partial Content"; 302 -> "Found"; 416 -> "Range Not Satisfiable"; 502 -> "Bad Gateway"; 503 -> "Service Unavailable"; else -> "OK" }
         val text = buildString {
             append("HTTP/1.1 $status $reason\r\nConnection: close\r\n")
             headers.forEach { (name, value) -> append("$name: $value\r\n") }
@@ -1485,15 +1555,61 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
         output.flush()
     }
 
-    private fun open(url: String, start: Long?, end: Long?, validator: String? = null): HttpURLConnection = (URL(url).openConnection() as HttpURLConnection).apply {
-        connectTimeout = StreamCacheTuning.ConnectMillis
-        readTimeout = StreamCacheTuning.ReadMillis
-        instanceFollowRedirects = true
-        setRequestProperty("Accept-Encoding", "identity")
-        setRequestProperty("User-Agent", "Mozilla/5.0 (Android) Moying/1.4")
-        if (start != null) setRequestProperty("Range", "bytes=$start-${end ?: ""}")
-        if (start != null && validator != null) setRequestProperty("If-Range", validator)
+    private fun upstreamFailure(value: Entry, output: OutputStream, status: Int = 502) {
+        if (value.hasRequestContext) respond(output, status, mapOf("Content-Length" to "0"))
+        else respond(output, 302, mapOf("Location" to value.url, "Content-Length" to "0"))
     }
+
+    private fun open(
+        value: Entry,
+        start: Long?,
+        end: Long?,
+        validator: String?,
+        onOpen: (HttpURLConnection) -> Unit,
+        onClose: (HttpURLConnection) -> Unit,
+    ): HttpURLConnection {
+        val requestHeaders = checkNotNull(value.requestHeaders)
+        val origin = URL(value.url)
+        var target = origin
+        for (hop in 0..StreamCacheTuning.MaxRedirects) {
+            if (value.hasRequestContext && (target.protocol !in setOf("http", "https") || target.userInfo != null || target.host.isBlank())) {
+                throw IOException("Invalid media address")
+            }
+            val connection = (target.openConnection() as HttpURLConnection).apply {
+                connectTimeout = StreamCacheTuning.ConnectMillis
+                readTimeout = StreamCacheTuning.ReadMillis
+                instanceFollowRedirects = !value.hasRequestContext
+                setRequestProperty("Accept-Encoding", "identity")
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Android) Moying/1.4")
+                MediaRequestHeaders.forRedirect(requestHeaders, origin, target).forEach { (name, header) ->
+                    setRequestProperty(name, header)
+                }
+                if (start != null) setRequestProperty("Range", "bytes=$start-${end ?: ""}")
+                if (start != null && validator != null) setRequestProperty("If-Range", validator)
+            }
+            var keep = false
+            try {
+                onOpen(connection)
+                val location = if (value.hasRequestContext && connection.responseCode in StreamCacheTuning.Redirects)
+                    connection.getHeaderField("Location") else null
+                if (location == null) {
+                    keep = true
+                    return connection
+                }
+                if (hop == StreamCacheTuning.MaxRedirects) throw IOException("Too many media redirects")
+                target = URL(target, location)
+            } finally {
+                if (!keep) {
+                    onClose(connection)
+                    connection.disconnect()
+                }
+            }
+        }
+        throw IOException("Too many media redirects")
+    }
+
+    private fun openRelay(value: Entry, start: Long, end: Long?, validator: String? = null): HttpURLConnection =
+        open(value, start, end, validator, { value.relays.add(it) }, { value.relays.remove(it) })
 
     private fun initializeRanges(value: Entry) = synchronized(value.ranges) {
         if (value.rangesInitialized) return
@@ -1568,8 +1684,7 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
                     return false
                 }
                 val chunkEnd = min(span.start + StreamCacheTuning.RangeChunkBytes - 1, end ?: Long.MAX_VALUE)
-                val connection = open(value.url, position, chunkEnd, value.validator)
-                value.relays += connection
+                val connection = openRelay(value, position, chunkEnd, value.validator)
                 var sink: FileOutputStream? = null
                 try {
                     val status = connection.responseCode
@@ -1632,12 +1747,11 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
     }
 
     private fun relayDirect(value: Entry, output: OutputStream, start: Long, end: Long?, head: Boolean, withHeaders: Boolean) {
-        val connection = open(value.url, start, end)
-        value.relays += connection
+        val connection = openRelay(value, start, end)
         try {
             val status = connection.responseCode
             if (status !in 200..299) {
-                if (withHeaders) respond(output, 302, mapOf("Location" to value.url, "Content-Length" to "0"))
+                if (withHeaders) upstreamFailure(value, output)
                 return
             }
             val partial = status == HttpURLConnection.HTTP_PARTIAL
@@ -1645,13 +1759,13 @@ internal class StreamingCacheProxy(context: Context, private val offlinePolicyOv
                 val returnedStart = Regex("bytes (\\d+)-").find(connection.getHeaderField("Content-Range").orEmpty())?.groupValues?.get(1)?.toLongOrNull()
                 if (returnedStart != start) {
                     value.bypass = true
-                    if (withHeaders) { respond(output, 302, mapOf("Location" to value.url, "Content-Length" to "0")); return }
+                    if (withHeaders) { upstreamFailure(value, output); return }
                     throw java.io.IOException("Mismatched direct range")
                 }
             } else if (start > 0L) {
                 // 源忽略 Range 返回整段 200：放弃缓存并让播放器重新直连，不把前面字节再走一遍网络。
                 value.bypass = true
-                if (withHeaders) { respond(output, 302, mapOf("Location" to value.url, "Content-Length" to "0")); return }
+                if (withHeaders) { upstreamFailure(value, output); return }
                 throw java.io.IOException("Range not supported")
             }
             val totalLength = connection.getHeaderField("Content-Range").orEmpty().substringAfterLast('/', "").toLongOrNull() ?: connection.contentLengthLong.takeIf { it >= 0L }

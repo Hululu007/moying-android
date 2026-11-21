@@ -21,6 +21,9 @@ data class TvBoxSource(
     val type: Int = 1,
     val origin: String = "",
     val format: String = "cms",
+    val playbackHeaders: Map<String, String> = emptyMap(),
+    val playbackResolver: PlaybackResolver? = null,
+    val playbackResolversByFlag: Map<String, PlaybackResolver> = emptyMap(),
 )
 
 /** 直接兼容 AppleCMS JSON/XML 与 M3U；不执行 TVBox Spider/Jar。网络由调用方调度到 IO。 */
@@ -145,6 +148,9 @@ class TvBoxMovieRepository(context: Context) : MovieRepository, SourceAvailabili
             row.optString("key").ifBlank { "import:" + SourceImport.hash(SourceImport.sourceKey(api)) },
             SourceImport.clean(row.optString("name")).ifBlank { Uri.parse(api).host.orEmpty() }, api, type,
             row.optString("config", row.optString("origin")), row.optString("format", "cms"),
+            playbackHeaders = SourceImport.declaredPlaybackHeaders(row),
+            playbackResolver = SourceImport.readPlaybackResolver(row.optJSONObject("playbackResolver")),
+            playbackResolversByFlag = SourceImport.readFlagResolvers(row.optJSONObject("playbackResolversByFlag")),
         )
     }.distinctBy { SourceImport.sourceKey(it.api) }
 
@@ -190,7 +196,14 @@ class TvBoxMovieRepository(context: Context) : MovieRepository, SourceAvailabili
     private fun persistSources(updated: List<TvBoxSource>, selected: String) {
         val sourceJson = JSONArray()
         updated.filter { it.id.startsWith("import:") }.forEach { source ->
-            sourceJson.put(JSONObject().put("key", source.id).put("name", source.name).put("api", source.api).put("type", source.type).put("origin", source.origin).put("format", source.format))
+            sourceJson.put(JSONObject().put("key", source.id).put("name", source.name).put("api", source.api)
+                .put("type", source.type).put("origin", source.origin).put("format", source.format).apply {
+                    if (source.playbackHeaders.isNotEmpty()) put("playbackHeaders", JSONObject(source.playbackHeaders))
+                    source.playbackResolver?.let { put("playbackResolver", SourceImport.playbackResolverJson(it)) }
+                    if (source.playbackResolversByFlag.isNotEmpty()) put("playbackResolversByFlag", JSONObject().apply {
+                        source.playbackResolversByFlag.forEach { (flag, resolver) -> put(flag, SourceImport.playbackResolverJson(resolver)) }
+                    })
+                })
         }
         preferences.edit().putString("importedSources", sourceJson.toString())
             .putStringSet("deletedSourceKeys", deletedSourceKeys.toSet()).putString("source", selected).apply()
@@ -381,7 +394,7 @@ class TvBoxMovieRepository(context: Context) : MovieRepository, SourceAvailabili
             val title = SourceImport.clean(row.optString("vod_name"))
             if (title.isBlank()) return@mapNotNull null
             val id = "tvbox:${source.id}:${row.optString("vod_id").ifBlank { title }}"
-            val normalized = SourceImport.normalizeMovie(row, id, category(row), "片源：${source.name}") ?: return@mapNotNull null
+            val normalized = SourceImport.normalizeMovie(row, id, category(row), "片源：${source.name}", source) ?: return@mapNotNull null
             rememberMovie(normalized, source)
         }
         val hasMore = root.pageCount?.let { page + 1 < it } ?: root.rows.isNotEmpty()
@@ -395,7 +408,7 @@ class TvBoxMovieRepository(context: Context) : MovieRepository, SourceAvailabili
     }
 
     private fun playlistMovies(source: TvBoxSource): List<Movie> =
-        playlists[source.id] ?: SourceImport.playlistRows(SourceImport.download(source.api), source.api).first.mapNotNull { row ->
+        playlists[source.id] ?: SourceImport.playlistRows(SourceImport.download(source.api), source.api, source.playbackHeaders).first.mapNotNull { row ->
             row.put("id", "tvbox:${source.id}:${SourceImport.hash(row.getJSONArray("episodes").getJSONObject(0).getString("url"))}")
                 .put("status", "直播").put("credit", "公开直播目录：${source.name}")
             rememberMovie(row, source)
