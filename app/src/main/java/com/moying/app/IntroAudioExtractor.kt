@@ -11,6 +11,7 @@ import android.os.SystemClock
 import kotlinx.coroutines.CancellationException
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.net.HttpURLConnection
@@ -29,7 +30,7 @@ private const val EpisodeByteLimit = 48L * 1024L * 1024L
 
 /** One budget covers both episodes in a comparison. */
 internal class IntroAudioScanBudget(private val isCancelled: () -> Boolean = { false }) {
-    private val deadline = SystemClock.elapsedRealtime() + 45_000L
+    private val deadline = SystemClock.elapsedRealtime() + 75_000L
     private val bytesRead = AtomicLong()
 
     fun check() {
@@ -37,9 +38,9 @@ internal class IntroAudioScanBudget(private val isCancelled: () -> Boolean = { f
         if (SystemClock.elapsedRealtime() >= deadline) throw IntroAudioScanException("片头识别超时，请稍后重试。")
     }
 
-    fun timeoutMillis(): Int {
+    fun timeoutMillis(limit: Int): Int {
         check()
-        return (deadline - SystemClock.elapsedRealtime()).coerceIn(1L, 2_500L).toInt()
+        return (deadline - SystemClock.elapsedRealtime()).coerceIn(1L, limit.toLong()).toInt()
     }
 
     fun remainingBytes(): Long = (2L * EpisodeByteLimit - bytesRead.get()).coerceAtLeast(0L)
@@ -50,6 +51,8 @@ internal class IntroAudioScanBudget(private val isCancelled: () -> Boolean = { f
 }
 
 private fun scanSizeLimit() = IntroAudioScanException("片头识别已达到流量上限，请尝试码率较低的线路。")
+
+private class IntroAudioResponseTimeout(part: String) : SocketTimeoutException("${part}响应超时，已重试一次。")
 
 internal class IntroAudioExtractor(context: Context) {
     private val app = context.applicationContext
@@ -79,7 +82,8 @@ internal class IntroAudioExtractor(context: Context) {
             throw failure
         } catch (failure: SocketTimeoutException) {
             budget.check()
-            throw IntroAudioScanException("片源响应超时，无法读取片头音频。")
+            val message = (failure as? IntroAudioResponseTimeout)?.message
+            throw IntroAudioScanException(message ?: "片源响应超时，无法读取片头音频。")
         } catch (failure: Exception) {
             budget.check()
             throw IntroAudioScanException("无法读取这集的音频，请尝试另一条线路。")
@@ -233,7 +237,7 @@ internal class IntroAudioExtractor(context: Context) {
             val variant = chooseVariant(url, lines)
             if (variant == null) {
                 val prefix = mediaPrefix(url, lines)
-                file.outputStream().buffered().use { output ->
+                file.outputStream().use { output ->
                     prefix.forEach { resource -> network.download(resource, output) }
                 }
                 return
@@ -376,7 +380,7 @@ internal class IntroAudioExtractor(context: Context) {
 
         fun check() = budget.check()
 
-        fun probe(url: String): Probe = open(url, 0L..(ProbeBytes - 1L)) { connection ->
+        fun probe(url: String): Probe = open(url, "片源入口", 0L..(ProbeBytes - 1L)) { connection ->
             val partial = connection.responseCode == HttpURLConnection.HTTP_PARTIAL
             val range = if (partial) responseRange(connection, 0L..(ProbeBytes - 1L)) else null
             val prefix = ByteArrayOutputStream(ProbeBytes)
@@ -407,7 +411,7 @@ internal class IntroAudioExtractor(context: Context) {
             } else probe
         }
 
-        fun playlist(url: String): Pair<String, String> = open(url) { connection ->
+        fun playlist(url: String): Pair<String, String> = open(url, "HLS 清单") { connection ->
             val output = ByteArrayOutputStream()
             connection.inputStream.use { copy(it, output, ManifestBytes, null) }
             val text = output.toString(Charsets.UTF_8.name()).trimStart('\ufeff', ' ', '\r', '\n', '\t')
@@ -415,15 +419,23 @@ internal class IntroAudioExtractor(context: Context) {
             connection.url.toString() to text
         }
 
-        fun download(resource: Resource, output: OutputStream) {
-            val cipher = resource.encryption?.let { encryption ->
+        fun download(resource: Resource, output: FileOutputStream) {
+            val decryption = resource.encryption?.let { encryption ->
                 val key = keys.getOrPut(encryption.declaration) { downloadKey(encryption.keyUrl) }
                 val iv = ByteArray(16) { index -> encryption.ivHex.substring(index * 2, index * 2 + 2).toInt(16).toByte() }
-                Cipher.getInstance("AES/CBC/PKCS5Padding").apply {
-                    init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-                }
+                key to iv
             }
-            open(resource.url, resource.range) { connection ->
+            val checkpoint = output.channel.position()
+            val rewind: () -> Unit = {
+                output.channel.truncate(checkpoint)
+                output.channel.position(checkpoint)
+            }
+            open(resource.url, "HLS 分片", resource.range, rewind) { connection ->
+                val cipher = decryption?.let { (key, iv) ->
+                    Cipher.getInstance("AES/CBC/PKCS5Padding").apply {
+                        init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                    }
+                }
                 val expected = if (resource.range != null) {
                     val range = responseRange(connection, resource.range)
                     if (range.end != resource.range.last) throw IntroAudioScanException("HLS 分片未返回完整的字节范围。")
@@ -439,7 +451,7 @@ internal class IntroAudioExtractor(context: Context) {
             val bytes = ByteArray(17)
             if (remaining() < bytes.size) throw scanSizeLimit()
             val count = try {
-                open(url) { connection ->
+                open(url, "HLS 密钥") { connection ->
                     val length = connection.contentLengthLong
                     if (length >= 0L && length != 16L) return@open 0
                     val limit = if (length == 16L) 16 else bytes.size
@@ -455,6 +467,8 @@ internal class IntroAudioExtractor(context: Context) {
                         received
                     }
                 }
+            } catch (timeout: IntroAudioResponseTimeout) {
+                throw timeout
             } catch (_: IOException) {
                 budget.check()
                 throw IntroAudioScanException("无法读取 HLS 解密密钥，请确认这条线路可正常播放。")
@@ -463,7 +477,7 @@ internal class IntroAudioExtractor(context: Context) {
             return bytes.copyOf(count)
         }
 
-        fun range(url: String, start: Long, end: Long, length: Long): ByteArray = open(url, start..end) { connection ->
+        fun range(url: String, start: Long, end: Long, length: Long): ByteArray = open(url, "视频字节范围", start..end) { connection ->
             val actual = responseRange(connection, start..end)
             if (actual.end != end || actual.total != length) throw IntroAudioScanException("片源返回了无效的视频字节范围。")
             val output = ByteArrayOutputStream((end - start + 1L).toInt())
@@ -471,16 +485,37 @@ internal class IntroAudioExtractor(context: Context) {
             output.toByteArray()
         }
 
-        private inline fun <T> open(raw: String, range: LongRange? = null, read: (HttpURLConnection) -> T): T {
+        private inline fun <T> open(
+            raw: String,
+            part: String,
+            range: LongRange? = null,
+            rewind: () -> Unit = {},
+            read: (HttpURLConnection) -> T,
+        ): T {
+            try {
+                return openOnce(raw, range, read)
+            } catch (_: SocketTimeoutException) {
+                budget.check()
+                // Keep transferred bytes charged to the scan, even when discarding a partial response.
+                rewind()
+            }
+            try {
+                return openOnce(raw, range, read)
+            } catch (_: SocketTimeoutException) {
+                budget.check()
+                throw IntroAudioResponseTimeout(part)
+            }
+        }
+
+        private inline fun <T> openOnce(raw: String, range: LongRange?, read: (HttpURLConnection) -> T): T {
             var url = URL(raw)
             repeat(5) {
-                val timeout = budget.timeoutMillis()
                 if (url.protocol !in listOf("http", "https")) throw IntroAudioScanException("片源重定向到了不支持的地址。")
                 val connection = url.openConnection() as HttpURLConnection
                 try {
                     connection.instanceFollowRedirects = false
-                    connection.connectTimeout = timeout
-                    connection.readTimeout = timeout
+                    connection.connectTimeout = budget.timeoutMillis(ConnectTimeoutMillis)
+                    connection.readTimeout = budget.timeoutMillis(ReadTimeoutMillis)
                     connection.useCaches = false
                     connection.setRequestProperty("User-Agent", "Mozilla/5.0 (Android) Moying/1.4")
                     connection.setRequestProperty("Accept-Encoding", "identity")
@@ -602,6 +637,8 @@ internal class IntroAudioExtractor(context: Context) {
         const val ProbeBytes = 4 * 1024
         const val SegmentBytes = 12 * 1024 * 1024
         const val BlockBytes = 512 * 1024
+        const val ConnectTimeoutMillis = 6_000
+        const val ReadTimeoutMillis = 10_000
         val Attribute = Regex("([A-Z0-9-]+)=(\"[^\"]*\"|[^,]*)")
         val HexIv = Regex("0[xX][0-9a-fA-F]{1,32}")
         val ContentRange = Regex("bytes (\\d+)-(\\d+)/(\\d+|\\*)", RegexOption.IGNORE_CASE)

@@ -3,6 +3,7 @@ package com.moying.app
 import android.content.Context
 import android.os.Bundle
 import kotlinx.coroutines.CancellationException
+import java.util.zip.CRC32
 import kotlin.math.abs
 
 internal object IntroAudioExtractorRegression {
@@ -11,6 +12,7 @@ internal object IntroAudioExtractorRegression {
         val extractor = IntroAudioExtractor(context)
         val result = Bundle()
         val failures = mutableListOf<String>()
+        val episodeOnePcm = mutableMapOf<String, String>()
 
         fun read(path: String, budget: IntroAudioScanBudget): Pair<IntroAudioFingerprint, String> {
             val collector = IntroAudioFingerprint.Collector()
@@ -18,21 +20,28 @@ internal object IntroAudioExtractorRegression {
             var nextTimeUs = -1L
             var frames = 0L
             var discontinuities = 0
+            val checksum = CRC32()
             extractor.scan("$base/$path", budget) { pcm, rate, channels, timeUs ->
                 if (firstTimeUs < 0L) firstTimeUs = timeUs
                 if (nextTimeUs >= 0L && abs(nextTimeUs - timeUs) > 12_000L) discontinuities++
                 val count = pcm.remaining() / (Short.SIZE_BYTES * channels)
                 frames += count
                 nextTimeUs = timeUs + count * 1_000_000L / rate
+                checksum.update(pcm.duplicate())
                 collector.appendPcm16(pcm, rate, channels, timeUs)
             }
-            return collector.finish() to "$frames PCM frames, ${firstTimeUs / 1_000L}–${nextTimeUs / 1_000L} ms, $discontinuities timestamp gaps"
+            return collector.finish() to "${checksum.value}: $frames PCM frames, ${firstTimeUs / 1_000L}–${nextTimeUs / 1_000L} ms, $discontinuities timestamp gaps"
         }
 
-        fun verify(label: String, episode: (Int) -> String) {
+        fun verify(label: String, expectedAudioPath: String? = null, episode: (Int) -> String) {
             val budget = IntroAudioScanBudget()
             try {
-                val (first, firstAudio) = read(episode(1), budget)
+                val firstPath = episode(1)
+                val (first, firstAudio) = read(firstPath, budget)
+                if (expectedAudioPath != null) {
+                    check(firstAudio == episodeOnePcm[expectedAudioPath]) { "Recovered audio did not match $expectedAudioPath: $firstAudio" }
+                }
+                episodeOnePcm[firstPath] = firstAudio
                 val (second, secondAudio) = read(episode(2), budget)
                 val match = checkNotNull(IntroAudioFingerprint.match(second, first, budget::check)) {
                     "Intro was not detected. Episode 1: $firstAudio. Episode 2: $secondAudio."
@@ -54,6 +63,18 @@ internal object IntroAudioExtractorRegression {
         verify("AES-128 MPEG-TS HLS") { "aes128/basic/episode-$it/index.m3u8" }
         verify("rotating AES-128 MPEG-TS HLS") { "aes128/rotating/episode-$it/index.m3u8" }
         verify("AES-128 fragmented MP4 HLS") { "aes128/fmp4/episode-$it/index.m3u8" }
+        verify("slow HLS response", "hls/episode-1/index.m3u8") {
+            if (it == 1) "slow/episode-1/index.m3u8" else "hls/episode-$it/index.m3u8"
+        }
+        verify("HLS response timeout retry", "hls/episode-1/index.m3u8") {
+            if (it == 1) "timeout-once/episode-1/index.m3u8" else "hls/episode-$it/index.m3u8"
+        }
+        verify("HLS partial body timeout retry", "hls/episode-1/index.m3u8") {
+            if (it == 1) "drop/episode-1/index.m3u8" else "hls/episode-$it/index.m3u8"
+        }
+        verify("AES-128 HLS partial body timeout retry", "aes128/rotating/episode-1/index.m3u8") {
+            if (it == 1) "aes-drop/episode-1/index.m3u8" else "aes128/rotating/episode-$it/index.m3u8"
+        }
 
         fun verifyRejected(path: String, reason: String) {
             val failure = runCatching { read(path, IntroAudioScanBudget()) }.exceptionOrNull()
