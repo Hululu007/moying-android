@@ -71,22 +71,27 @@ internal class IntroAudioExtractor(context: Context) {
         onPcm: (ByteBuffer, Int, Int, Long) -> Unit,
     ) = scan(url, budget, emptyMap(), onPcm)
 
+    /** Returns true if an HLS boundary limited the scan to its first continuous interval. */
     fun scan(
         url: String,
         budget: IntroAudioScanBudget,
         headers: Map<String, String>,
         onPcm: (ByteBuffer, Int, Int, Long) -> Unit,
-    ) {
+    ): Boolean {
         budget.check()
         try {
             val uri = Uri.parse(url)
-            when (uri.scheme?.lowercase()) {
+            return when (uri.scheme?.lowercase()) {
                 "http", "https" -> scanNetwork(url, budget, MediaRequestHeaders.normalize(headers), onPcm)
-                "content" -> decode(budget, false, onPcm) { it.setDataSource(app, uri, null) }
+                "content" -> {
+                    decode(budget, false, onPcm) { it.setDataSource(app, uri, null) }
+                    false
+                }
                 "file", null -> {
                     val file = File(uri.path.orEmpty())
                     if (!file.isAbsolute || !file.isFile) throw IntroAudioScanException("无法读取这集的本地视频。")
                     decodeFile(file, budget, false, onPcm)
+                    false
                 }
                 else -> throw IntroAudioScanException("这条线路的视频格式暂不支持片头识别。")
             }
@@ -109,15 +114,16 @@ internal class IntroAudioExtractor(context: Context) {
         budget: IntroAudioScanBudget,
         headers: Map<String, String>,
         onPcm: (ByteBuffer, Int, Int, Long) -> Unit,
-    ) {
+    ): Boolean {
         val network = ScanNetwork(budget)
         val probe = network.probe(url, headers)
         val playlist = probe.playlist
         if (playlist != null) {
             val file = File.createTempFile("intro-audio-", ".media", app.cacheDir)
             try {
-                downloadHlsPrefix(probe.url, playlist, probe.headers, file, network, budget)
+                val limitedByBoundary = downloadHlsPrefix(probe.url, playlist, probe.headers, file, network, budget)
                 decodeFile(file, budget, true, onPcm)
+                return limitedByBoundary
             } finally {
                 file.delete()
             }
@@ -130,6 +136,7 @@ internal class IntroAudioExtractor(context: Context) {
                     source.failure?.let { throw it }
                 }
             }
+            return false
         }
     }
 
@@ -248,7 +255,7 @@ internal class IntroAudioExtractor(context: Context) {
         file: File,
         network: ScanNetwork,
         budget: IntroAudioScanBudget,
-    ) {
+    ): Boolean {
         var url = initialUrl
         var text = firstPlaylist
         var headers = initialHeaders
@@ -257,8 +264,9 @@ internal class IntroAudioExtractor(context: Context) {
             val lines = text.lineSequence().map(String::trim).filter(String::isNotEmpty).toList()
             val variant = chooseVariant(url, lines)
             if (variant == null) {
-                downloadResources(mediaPrefix(url, lines), file, network, budget, headers)
-                return
+                val prefix = mediaPrefix(url, lines)
+                downloadResources(prefix.resources, file, network, budget, headers)
+                return prefix.limitedByBoundary
             }
             val next = network.playlist(variant, headers)
             url = next.url
@@ -357,6 +365,8 @@ internal class IntroAudioExtractor(context: Context) {
     private data class KeyTag(val declaration: Int, val attributes: Map<String, String>)
     private data class Encryption(val declaration: Int, val keyUrl: String, val ivHex: String)
     private data class Resource(val url: String, val range: LongRange? = null, val encryption: Encryption? = null)
+    private data class MapTag(val attributes: Map<String, String>, val keys: Map<String, KeyTag>)
+    private data class MediaPrefix(val resources: List<Resource>, val limitedByBoundary: Boolean)
     private data class Variant(val url: String, val audioGroup: String?, val bandwidth: Long)
 
     private fun chooseVariant(base: String, lines: List<String>): String? {
@@ -375,12 +385,13 @@ internal class IntroAudioExtractor(context: Context) {
         return rendition?.get("URI")?.let { resolve(base, it) } ?: variant.url
     }
 
-    private fun mediaPrefix(base: String, lines: List<String>): List<Resource> {
+    private fun mediaPrefix(base: String, lines: List<String>): MediaPrefix {
         if ("#EXT-X-ENDLIST" !in lines) throw IntroAudioScanException("直播或未完结的 HLS 列表暂不支持片头识别。")
         if ("#EXT-X-I-FRAMES-ONLY" in lines) throw IntroAudioScanException("仅含关键帧的 HLS 列表暂不支持片头识别。")
         val prefix = mutableListOf<Resource>()
         val keys = mutableMapOf<String, KeyTag>()
         var init: Resource? = null
+        var pendingMap: MapTag? = null
         var elapsedUs = 0L
         var segmentDurationUs = 0L
         var segmentCount = 0
@@ -402,14 +413,16 @@ internal class IntroAudioExtractor(context: Context) {
                     mediaSequence = line.substringAfter(':').toULongOrNull() ?: throw invalidPlaylist()
                 }
                 line.startsWith("#EXT-X-MAP:") -> {
-                    val attrs = attributes(line)
-                    val url = resolve(base, attrs["URI"] ?: throw invalidPlaylist())
-                    val nextInit = Resource(url, attrs["BYTERANGE"]?.let { byteRange(it, 0L) }, encryption(base, keys, null))
-                    if (segmentCount > 0 && init != nextInit) throw invalidTimeline()
-                    init = nextInit
+                    // Preserve the keys at the declaration. Resolve the map only if its segment is scanned.
+                    pendingMap = MapTag(attributes(line), keys.toMap())
                 }
-                line == "#EXT-X-DISCONTINUITY" && segmentCount > 0 -> throw invalidTimeline()
-                line == "#EXT-X-GAP" -> throw invalidTimeline()
+                // The decoded timestamps are normalized once, at the start of the playlist.
+                // Keep only media that can share that origin.
+                line == "#EXT-X-DISCONTINUITY" && segmentCount > 0 -> return MediaPrefix(prefix, true)
+                line == "#EXT-X-GAP" -> {
+                    if (segmentCount == 0) throw IntroAudioScanException("这条 HLS 线路的首个分片缺失，无法定位片头。可以手动设置片头结束点。")
+                    return MediaPrefix(prefix, true)
+                }
                 line.startsWith("#EXTINF:") -> {
                     val seconds = line.substringAfter(':').substringBefore(',').toDoubleOrNull()
                     if (seconds == null || !seconds.isFinite() || seconds <= 0.0) throw invalidPlaylist()
@@ -417,6 +430,22 @@ internal class IntroAudioExtractor(context: Context) {
                 }
                 line.startsWith("#EXT-X-BYTERANGE:") -> pendingRange = line.substringAfter(':')
                 !line.startsWith('#') -> {
+                    pendingMap?.let { tag ->
+                        val nextInit = try {
+                            val url = resolve(base, tag.attributes["URI"] ?: throw invalidPlaylist())
+                            val range = tag.attributes["BYTERANGE"]?.let { byteRange(it, 0L) }
+                            if (segmentCount > 0 && (init?.url != url || init?.range != range)) {
+                                return MediaPrefix(prefix, true)
+                            }
+                            Resource(url, range, encryption(base, tag.keys, null))
+                        } catch (failure: IOException) {
+                            if (segmentCount > 0) return MediaPrefix(prefix, true)
+                            throw failure
+                        }
+                        if (segmentCount > 0 && nextInit != init) return MediaPrefix(prefix, true)
+                        init = nextInit
+                        pendingMap = null
+                    }
                     if (segmentDurationUs <= 0L) throw invalidPlaylist()
                     if (segmentCount == 0) init?.let(prefix::add)
                     val url = resolve(base, line)
@@ -435,7 +464,7 @@ internal class IntroAudioExtractor(context: Context) {
             }
         }
         if (segmentCount == 0) throw invalidPlaylist()
-        return prefix
+        return MediaPrefix(prefix, false)
     }
 
     private fun encryption(base: String, keys: Map<String, KeyTag>, sequence: ULong?): Encryption? {
@@ -470,7 +499,6 @@ internal class IntroAudioExtractor(context: Context) {
         .associate { match -> match.groupValues[1] to match.groupValues[2].removeSurrounding("\"") }
 
     private fun invalidPlaylist() = IntroAudioScanException("HLS 播放列表格式无法识别。")
-    private fun invalidTimeline() = IntroAudioScanException("这条 HLS 线路开头的时间轴不连续，无法可靠识别片头。")
     private fun unsupportedEncryption() = IntroAudioScanException("这条 HLS 线路使用暂不支持的加密方式，无法识别片头。")
     private fun invalidKey() = IntroAudioScanException("HLS 播放列表的 AES-128 密钥地址无效。")
 

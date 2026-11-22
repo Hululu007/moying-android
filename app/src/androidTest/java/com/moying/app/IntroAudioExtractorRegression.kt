@@ -15,14 +15,14 @@ internal object IntroAudioExtractorRegression {
         val failures = mutableListOf<String>()
         val episodeOnePcm = mutableMapOf<String, String>()
 
-        fun read(path: String, budget: IntroAudioScanBudget): Pair<IntroAudioFingerprint, String> {
+        fun read(path: String, budget: IntroAudioScanBudget, expectBoundary: Boolean = false): Pair<IntroAudioFingerprint, String> {
             val collector = IntroAudioFingerprint.Collector()
             var firstTimeUs = -1L
             var nextTimeUs = -1L
             var frames = 0L
             var discontinuities = 0
             val checksum = CRC32()
-            extractor.scan("$base/$path", budget) { pcm, rate, channels, timeUs ->
+            val limitedByBoundary = extractor.scan("$base/$path", budget) { pcm, rate, channels, timeUs ->
                 if (firstTimeUs < 0L) firstTimeUs = timeUs
                 if (nextTimeUs >= 0L && abs(nextTimeUs - timeUs) > 12_000L) discontinuities++
                 val count = pcm.remaining() / (Short.SIZE_BYTES * channels)
@@ -31,26 +31,27 @@ internal object IntroAudioExtractorRegression {
                 checksum.update(pcm.duplicate())
                 collector.appendPcm16(pcm, rate, channels, timeUs)
             }
+            check(limitedByBoundary == expectBoundary) { "Unexpected HLS boundary status for $path: $limitedByBoundary" }
             return collector.finish() to "${checksum.value}: $frames PCM frames, ${firstTimeUs / 1_000L}–${nextTimeUs / 1_000L} ms, $discontinuities timestamp gaps"
         }
 
-        fun verify(label: String, expectedAudioPath: String? = null, episode: (Int) -> String) {
+        fun verify(label: String, expectedAudioPath: String? = null, expectBoundary: Boolean = false, episode: (Int) -> String) {
             val budget = IntroAudioScanBudget()
             try {
                 val firstPath = episode(1)
-                val (first, firstAudio) = read(firstPath, budget)
+                val (first, firstAudio) = read(firstPath, budget, expectBoundary)
                 if (expectedAudioPath != null) {
                     check(firstAudio == episodeOnePcm[expectedAudioPath]) { "Recovered audio did not match $expectedAudioPath: $firstAudio" }
                 }
                 episodeOnePcm[firstPath] = firstAudio
-                val (second, secondAudio) = read(episode(2), budget)
+                val (second, secondAudio) = read(episode(2), budget, expectBoundary)
                 val match = checkNotNull(IntroAudioFingerprint.match(second, first, budget::check)) {
                     "Intro was not detected. Episode 1: $firstAudio. Episode 2: $secondAudio."
                 }
                 check(abs(match.startMillis - 7_000L) < 1_000L && abs(match.endMillis - 32_000L) < 1_000L &&
                     abs(match.referenceStartMillis - 3_000L) < 1_000L && abs(match.referenceEndMillis - 28_000L) < 1_000L
                 ) { "Unexpected timestamps $match" }
-                val (unrelated) = read(episode(3), IntroAudioScanBudget())
+                val (unrelated) = read(episode(3), IntroAudioScanBudget(), expectBoundary)
                 check(IntroAudioFingerprint.match(unrelated, first) == null) { "Matched an unrelated episode" }
                 result.putString(label, match.toString())
             } catch (error: Exception) {
@@ -109,6 +110,19 @@ internal object IntroAudioExtractorRegression {
         verifyRejected("negative/invalid-key.m3u8", "无效的 HLS AES-128 密钥")
         verifyRejected("negative/sample-aes.m3u8", "暂不支持的加密方式")
         verifyRejected("negative/drm.m3u8", "暂不支持的加密方式")
+        if (args.getString("introTimelineFixture") == "true") {
+            verify("HLS discontinuity after intro", expectBoundary = true) { "timeline/after/episode-$it/index.m3u8" }
+            verify("HLS discontinuity before first segment") { "timeline/leading/episode-$it/index.m3u8" }
+            verify("HLS gap after intro", expectBoundary = true) { "timeline/gap-after/episode-$it/index.m3u8" }
+            verify("HLS init map change after intro", expectBoundary = true) { "timeline/map-after/episode-$it/index.m3u8" }
+
+            val budget = IntroAudioScanBudget()
+            val (first) = read("timeline/during/episode-1/index.m3u8", budget, expectBoundary = true)
+            val (second) = read("timeline/during/episode-2/index.m3u8", budget, expectBoundary = true)
+            check(IntroAudioFingerprint.match(second, first, budget::check) == null) { "Matched an intro cut by an HLS boundary" }
+            verifyRejected("timeline/gap-first/episode-1/index.m3u8", "首个分片缺失")
+            result.putString("HLS boundary with no complete intro", "rejected partial match and missing first segment")
+        }
         check(runCatching { read("episode-1.mp4", IntroAudioScanBudget { true }) }.exceptionOrNull() is CancellationException)
         result.putString("rejections", "live HLS, missing and invalid AES-128 keys, SAMPLE-AES, DRM, cancelled scan")
         check(failures.isEmpty()) { "${failures.joinToString("\n")}\nCompleted results: $result" }
