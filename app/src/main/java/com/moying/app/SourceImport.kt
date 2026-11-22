@@ -4,10 +4,13 @@ import android.net.Uri
 import android.os.SystemClock
 import android.text.Html
 import android.util.Xml
+import kotlinx.coroutines.CancellationException
 import org.json.JSONArray
+import org.json.JSONException
 import org.json.JSONObject
 import org.xmlpull.v1.XmlPullParser
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
@@ -53,6 +56,7 @@ internal object SourceImport {
     private const val MAX_REQUESTS = 8
     private const val MAX_TOTAL_BYTES = 12 * 1024 * 1024
     private const val DOWNLOAD_TIMEOUT = 18_000L
+    private const val DIRECT_CONFIG_TIMEOUT = 6_000L
     private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 13) Moying/1.3"
     private const val TVBOX_USER_AGENT = "TVBox"
     private const val RESOLVER_TOKEN = "{url}"
@@ -205,8 +209,44 @@ internal object SourceImport {
     fun download(address: String, userAgent: String? = null): String =
         downloadText(address, userAgent ?: DEFAULT_USER_AGENT, SystemClock.elapsedRealtime() + DOWNLOAD_TIMEOUT).text
 
+    internal fun directSubscriptionAddress(address: String): String? {
+        val uri = runCatching { URI(address) }.getOrNull() ?: return null
+        if (!uri.scheme.equals("https", true) || !uri.host.equals("xh.159e.cn", true) ||
+            uri.rawUserInfo != null || uri.port !in listOf(-1, 443) ||
+            uri.rawQuery != null || uri.rawFragment != null || uri.rawPath !in listOf("/v1", "/v1/")
+        ) return null
+        return "https://xh.159e.cn/vip.json"
+    }
+
+    private fun hasCompatibleTvBoxSites(config: DownloadedText): Boolean {
+        val value = afterJsonComments(config.text.trimStart { it.isWhitespace() || it == '\uFEFF' })
+        val sites = try {
+            JSONObject(value).optJSONArray("sites")
+        } catch (_: JSONException) {
+            null
+        } ?: return false
+        return (0 until sites.length()).any { index ->
+            val site = sites.optJSONObject(index) ?: return@any false
+            site.optInt("type", -1) in 0..1 && configAddress(site.optString("api"), config.address) != null
+        }
+    }
+
     private fun downloadSubscription(address: String): DownloadedText {
-        val deadline = SystemClock.elapsedRealtime() + DOWNLOAD_TIMEOUT
+        val started = SystemClock.elapsedRealtime()
+        val deadline = started + DOWNLOAD_TIMEOUT
+        // 小盒的 TVBox 入口可能跳转到 HTTP，优先读取同站的 HTTPS 配置。
+        directSubscriptionAddress(address)?.let { directAddress ->
+            val direct = try {
+                downloadText(directAddress, DEFAULT_USER_AGENT, started + DIRECT_CONFIG_TIMEOUT, allowRedirects = false)
+            } catch (_: IOException) {
+                SourceRequests.checkActive()
+                null
+            } catch (_: IllegalArgumentException) {
+                SourceRequests.checkActive()
+                null
+            }
+            if (direct != null && hasCompatibleTvBoxSites(direct)) return direct
+        }
         val standard = downloadText(address, DEFAULT_USER_AGENT, deadline)
         if (!isHtml(standard.text)) return standard
         val compatible = downloadText(address, TVBOX_USER_AGENT, deadline)
@@ -214,7 +254,7 @@ internal object SourceImport {
         return compatible
     }
 
-    private fun downloadText(address: String, userAgent: String, deadline: Long): DownloadedText {
+    private fun downloadText(address: String, userAgent: String, deadline: Long, allowRedirects: Boolean = true): DownloadedText {
         require(validUrl(address)) { "只支持 HTTP(S) 订阅地址" }
         var current = address
         repeat(5) {
@@ -229,6 +269,7 @@ internal object SourceImport {
                 val code = connection.responseCode
                 SourceRequests.timeout(8000, deadline)
                 if (code in listOf(301, 302, 303, 307, 308)) {
+                    require(allowRedirects) { "直连订阅配置发生重定向" }
                     val location = connection.getHeaderField("Location") ?: error("订阅重定向缺少地址")
                     current = URL(URL(current), location).toString()
                     require(validUrl(current)) { "不支持此重定向协议" }
@@ -304,7 +345,7 @@ internal object SourceImport {
                     val downloaded = downloadSubscription(text)
                     visit(downloaded.text, downloaded.address, depth + 1)
                 }.onFailure {
-                    if (it is InterruptedException) throw it
+                    if (it is InterruptedException || it is CancellationException) throw it
                     batch.skipped++
                     batch.notes += it.message.orEmpty()
                 }

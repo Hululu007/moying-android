@@ -44,6 +44,7 @@ class SourceDeletionInstrumentation : Instrumentation() {
         when (suiteArguments.getString("suite")) {
             "stream-cache" -> { StreamingCacheRegression.run(this, suiteArguments); return }
             "source-requests" -> { runSuite { SourceRequestRegression.run() }; return }
+            "subscription-import" -> { runSuite { subscriptionImportRegression() }; return }
             "poster-loader" -> { runSuite { PosterLoaderRegression.run(targetContext) }; return }
             "intro-audio-fingerprint" -> {
                 runSuite {
@@ -501,6 +502,64 @@ class SourceDeletionInstrumentation : Instrumentation() {
                 putString("stream", "\nSource deletion regression: $assertions assertions, $completedCases cases, ${failures.size} failures.\n" + failures.joinToString("\n"))
             }
             finish(if (failures.isEmpty()) Activity.RESULT_OK else Activity.RESULT_CANCELED, result)
+        }
+    }
+
+    private fun subscriptionImportRegression(): Bundle {
+        val direct = "https://xh.159e.cn/vip.json"
+        listOf("https://xh.159e.cn/v1", "https://xh.159e.cn/v1/", "https://xh.159e.cn:443/v1").forEach {
+            check(SourceImport.directSubscriptionAddress(it) == direct) { "小盒订阅路径应匹配直连配置" }
+        }
+        listOf(
+            "http://xh.159e.cn/v1", "https://xh.159e.cn:8443/v1", "https://name@xh.159e.cn/v1",
+            "https://xh.159e.cn/v1?q=1", "https://xh.159e.cn/v1#anchor", "https://xh.159e.cn/v10",
+            "https://xh.159e.cn.invalid/v1", "https://xh.159e.cn/%76%31",
+        ).forEach {
+            check(SourceImport.directSubscriptionAddress(it) == null) { "无关地址应沿用普通订阅读取" }
+        }
+        val fixture = """
+            // TVBox 配置
+            /* 订阅说明 */
+            {
+              "spider":"https://plugins.invalid/spider.jar",
+              "sites":[
+                {"name":"Fixture CMS","type":1,"api":"https://cms.invalid/api","header":{"Referer":"https://cms.invalid/"}},
+                {"name":"Fixture plugin","type":3,"api":"csp_XBPQ","ext":"./plugin.json"}
+              ],
+              "lives":[{"name":"Fixture live","type":0,"url":"./live.txt","ua":"FixtureUA"}]
+            }
+        """.trimIndent()
+        IsolatedPreferencesContext(targetContext).use { isolated ->
+            val repository = TvBoxMovieRepository(isolated)
+            val imported = repository.importSources(fixture, direct)
+            check(imported.addedSources == 2 && imported.skipped == 1) { "应导入 CMS 和直播并跳过插件" }
+            val restart = TvBoxMovieRepository(isolated)
+            val live = restart.sources.single { it.name == "Fixture live" }
+            check(live.format == "m3u" && live.api == "https://xh.159e.cn/live.txt") { "应按直连配置解析相对直播地址" }
+            check(live.playbackHeaders["User-Agent"] == "FixtureUA") { "应保留直播 User-Agent" }
+            val cms = restart.sources.single { it.name == "Fixture CMS" }
+            check(cms.playbackHeaders["Referer"] == "https://cms.invalid/") { "应保留 CMS Referer" }
+            check(restart.sources.none { it.name == "Fixture plugin" }) { "不应保存需执行插件的片源" }
+        }
+        return Bundle().apply {
+            putString("subscriptionFixture", "passed")
+            val address = suiteArguments.getString("subscriptionAddress") ?: return@apply
+            check(SourceImport.directSubscriptionAddress(address) != null) { "实际测试仅接受小盒订阅路径" }
+            IsolatedPreferencesContext(targetContext).use { isolated ->
+                val repository = TvBoxMovieRepository(isolated)
+                val priorIds = repository.sources.map { it.id }.toSet()
+                val result = repository.importSources(address)
+                check(result.addedSources > 0) { "实际订阅未新增片源" }
+                val sources = TvBoxMovieRepository(isolated).sources.filter { it.id !in priorIds }
+                check(sources.size == result.addedSources && sources.any { it.format == "m3u" }) { "实际订阅应保存新增片源和直播" }
+                val catalog = sources.filter { it.format == "cms" }.take(3).firstNotNullOfOrNull { source ->
+                    runCatching { repository.getCatalogMovies(source.id, 0, CatalogRecommend, "", emptyMap()).items.size }
+                        .getOrNull()?.takeIf { it > 0 }
+                }
+                putInt("subscriptionAddedSources", result.addedSources)
+                putInt("subscriptionSkippedEntries", result.skipped)
+                putInt("subscriptionFirstCatalogItems", checkNotNull(catalog) { "前 3 个新 CMS 均未返回影片" })
+            }
         }
     }
 
