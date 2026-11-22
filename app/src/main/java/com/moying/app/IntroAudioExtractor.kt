@@ -31,7 +31,9 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-internal class IntroAudioScanException(message: String) : IOException(message)
+internal open class IntroAudioScanException(message: String) : IOException(message)
+
+internal enum class IntroAudioScanCoverage { FULL, TIMELINE_BOUNDARY, BYTE_LIMIT }
 
 private const val EpisodeByteLimit = 48L * 1024L * 1024L
 
@@ -52,12 +54,22 @@ internal class IntroAudioScanBudget(private val isCancelled: () -> Boolean = { f
 
     fun remainingBytes(): Long = (2L * EpisodeByteLimit - bytesRead.get()).coerceAtLeast(0L)
 
-    fun addBytes(count: Int) {
-        if (bytesRead.addAndGet(count.toLong()) > 2L * EpisodeByteLimit) throw scanSizeLimit()
-    }
+    fun reserveBytes(count: Int): Int = reserveReadBytes(bytesRead, 2L * EpisodeByteLimit, count)
+
+    fun releaseBytes(count: Int) { bytesRead.addAndGet(-count.toLong()) }
 }
 
-private fun scanSizeLimit() = IntroAudioScanException("片头识别已达到流量上限，请尝试码率较低的线路。")
+private class IntroAudioSizeLimit : IntroAudioScanException("片头识别已达到流量上限，请尝试码率较低的线路。")
+
+private fun scanSizeLimit() = IntroAudioSizeLimit()
+
+private fun reserveReadBytes(counter: AtomicLong, limit: Long, requested: Int): Int {
+    while (true) {
+        val used = counter.get()
+        val reserved = minOf(limit - used, requested.toLong()).toInt()
+        if (reserved == 0 || counter.compareAndSet(used, used + reserved)) return reserved
+    }
+}
 
 private class IntroAudioResponseTimeout(part: String) : SocketTimeoutException("${part}响应超时，已重试一次。")
 
@@ -71,13 +83,13 @@ internal class IntroAudioExtractor(context: Context) {
         onPcm: (ByteBuffer, Int, Int, Long) -> Unit,
     ) = scan(url, budget, emptyMap(), onPcm)
 
-    /** Returns true if an HLS boundary limited the scan to its first continuous interval. */
+    /** Reports whether an HLS boundary or byte limit shortened the scan. */
     fun scan(
         url: String,
         budget: IntroAudioScanBudget,
         headers: Map<String, String>,
         onPcm: (ByteBuffer, Int, Int, Long) -> Unit,
-    ): Boolean {
+    ): IntroAudioScanCoverage {
         budget.check()
         try {
             val uri = Uri.parse(url)
@@ -85,13 +97,13 @@ internal class IntroAudioExtractor(context: Context) {
                 "http", "https" -> scanNetwork(url, budget, MediaRequestHeaders.normalize(headers), onPcm)
                 "content" -> {
                     decode(budget, false, onPcm) { it.setDataSource(app, uri, null) }
-                    false
+                    IntroAudioScanCoverage.FULL
                 }
                 "file", null -> {
                     val file = File(uri.path.orEmpty())
                     if (!file.isAbsolute || !file.isFile) throw IntroAudioScanException("无法读取这集的本地视频。")
                     decodeFile(file, budget, false, onPcm)
-                    false
+                    IntroAudioScanCoverage.FULL
                 }
                 else -> throw IntroAudioScanException("这条线路的视频格式暂不支持片头识别。")
             }
@@ -114,16 +126,16 @@ internal class IntroAudioExtractor(context: Context) {
         budget: IntroAudioScanBudget,
         headers: Map<String, String>,
         onPcm: (ByteBuffer, Int, Int, Long) -> Unit,
-    ): Boolean {
+    ): IntroAudioScanCoverage {
         val network = ScanNetwork(budget)
         val probe = network.probe(url, headers)
         val playlist = probe.playlist
         if (playlist != null) {
             val file = File.createTempFile("intro-audio-", ".media", app.cacheDir)
             try {
-                val limitedByBoundary = downloadHlsPrefix(probe.url, playlist, probe.headers, file, network, budget)
+                val coverage = downloadHlsPrefix(probe.url, playlist, probe.headers, file, network, budget)
                 decodeFile(file, budget, true, onPcm)
-                return limitedByBoundary
+                return coverage
             } finally {
                 file.delete()
             }
@@ -136,7 +148,7 @@ internal class IntroAudioExtractor(context: Context) {
                     source.failure?.let { throw it }
                 }
             }
-            return false
+            return IntroAudioScanCoverage.FULL
         }
     }
 
@@ -255,7 +267,7 @@ internal class IntroAudioExtractor(context: Context) {
         file: File,
         network: ScanNetwork,
         budget: IntroAudioScanBudget,
-    ): Boolean {
+    ): IntroAudioScanCoverage {
         var url = initialUrl
         var text = firstPlaylist
         var headers = initialHeaders
@@ -265,8 +277,7 @@ internal class IntroAudioExtractor(context: Context) {
             val variant = chooseVariant(url, lines)
             if (variant == null) {
                 val prefix = mediaPrefix(url, lines)
-                downloadResources(prefix.resources, file, network, budget, headers)
-                return prefix.limitedByBoundary
+                return downloadResources(prefix, file, network, budget, headers)
             }
             val next = network.playlist(variant, headers)
             url = next.url
@@ -277,15 +288,16 @@ internal class IntroAudioExtractor(context: Context) {
     }
 
     private fun downloadResources(
-        resources: List<Resource>,
+        prefix: MediaPrefix,
         file: File,
         network: ScanNetwork,
         budget: IntroAudioScanBudget,
         headers: Map<String, String>,
-    ) {
+    ): IntroAudioScanCoverage {
+        val resources = prefix.resources
         if (resources.size == 1) {
             file.outputStream().use { network.download(resources.single(), it, headers) }
-            return
+            return prefix.coverage
         }
         // Keep a small window in flight and append finished parts in playlist order.
         // Each retry rewinds its own part, including encrypted and byte-range resources.
@@ -305,7 +317,7 @@ internal class IntroAudioExtractor(context: Context) {
                         if (stopped) throw CancellationException("已取消片头识别")
                         part.outputStream()
                     }
-                output.use { network.download(resource, it, headers) }
+                    output.use { network.download(resource, it, headers) }
                 } finally {
                     synchronized(directory) {
                         if (stopped) {
@@ -319,10 +331,18 @@ internal class IntroAudioExtractor(context: Context) {
         try {
             file.outputStream().use { output ->
                 val buffer = ByteArray(16 * 1024)
-                repeat(minOf(HlsDownloadWorkers, resources.size)) { enqueue() }
-                while (pending.isNotEmpty()) {
+                var completed = 0
+                while (completed < resources.size) {
+                    // Drain existing requests near the limit, then give the next segment priority.
+                    val window = if (network.remaining() > 2L * SegmentBytes) HlsDownloadWorkers else 1
+                    while (next < resources.size && pending.size < window) enqueue()
                     val (part, future) = pending.first()
-                    awaitPart(future, budget)
+                    try {
+                        awaitPart(future, budget)
+                    } catch (limit: IntroAudioSizeLimit) {
+                        if (completed <= prefix.initCount) throw limit
+                        return IntroAudioScanCoverage.BYTE_LIMIT
+                    }
                     part.inputStream().use { input ->
                         while (true) {
                             budget.check()
@@ -333,7 +353,7 @@ internal class IntroAudioExtractor(context: Context) {
                     }
                     part.delete()
                     pending.removeFirst()
-                    if (next < resources.size) enqueue()
+                    completed++
                 }
             }
         } finally {
@@ -344,6 +364,7 @@ internal class IntroAudioExtractor(context: Context) {
             workers.shutdownNow()
             directory.deleteRecursively()
         }
+        return prefix.coverage
     }
 
     private fun awaitPart(future: Future<*>, budget: IntroAudioScanBudget) {
@@ -366,7 +387,7 @@ internal class IntroAudioExtractor(context: Context) {
     private data class Encryption(val declaration: Int, val keyUrl: String, val ivHex: String)
     private data class Resource(val url: String, val range: LongRange? = null, val encryption: Encryption? = null)
     private data class MapTag(val attributes: Map<String, String>, val keys: Map<String, KeyTag>)
-    private data class MediaPrefix(val resources: List<Resource>, val limitedByBoundary: Boolean)
+    private data class MediaPrefix(val resources: List<Resource>, val initCount: Int, val coverage: IntroAudioScanCoverage)
     private data class Variant(val url: String, val audioGroup: String?, val bandwidth: Long)
 
     private fun chooseVariant(base: String, lines: List<String>): String? {
@@ -398,6 +419,7 @@ internal class IntroAudioExtractor(context: Context) {
         var mediaSequence = 0UL
         var pendingRange: String? = null
         var previous: Resource? = null
+        fun result(coverage: IntroAudioScanCoverage) = MediaPrefix(prefix, if (init == null) 0 else 1, coverage)
         for ((lineIndex, line) in lines.withIndex()) {
             when {
                 line.startsWith("#EXT-X-KEY:") -> {
@@ -418,10 +440,10 @@ internal class IntroAudioExtractor(context: Context) {
                 }
                 // The decoded timestamps are normalized once, at the start of the playlist.
                 // Keep only media that can share that origin.
-                line == "#EXT-X-DISCONTINUITY" && segmentCount > 0 -> return MediaPrefix(prefix, true)
+                line == "#EXT-X-DISCONTINUITY" && segmentCount > 0 -> return result(IntroAudioScanCoverage.TIMELINE_BOUNDARY)
                 line == "#EXT-X-GAP" -> {
                     if (segmentCount == 0) throw IntroAudioScanException("这条 HLS 线路的首个分片缺失，无法定位片头。可以手动设置片头结束点。")
-                    return MediaPrefix(prefix, true)
+                    return result(IntroAudioScanCoverage.TIMELINE_BOUNDARY)
                 }
                 line.startsWith("#EXTINF:") -> {
                     val seconds = line.substringAfter(':').substringBefore(',').toDoubleOrNull()
@@ -435,14 +457,14 @@ internal class IntroAudioExtractor(context: Context) {
                             val url = resolve(base, tag.attributes["URI"] ?: throw invalidPlaylist())
                             val range = tag.attributes["BYTERANGE"]?.let { byteRange(it, 0L) }
                             if (segmentCount > 0 && (init?.url != url || init?.range != range)) {
-                                return MediaPrefix(prefix, true)
+                                return result(IntroAudioScanCoverage.TIMELINE_BOUNDARY)
                             }
                             Resource(url, range, encryption(base, tag.keys, null))
                         } catch (failure: IOException) {
-                            if (segmentCount > 0) return MediaPrefix(prefix, true)
+                            if (segmentCount > 0) return result(IntroAudioScanCoverage.TIMELINE_BOUNDARY)
                             throw failure
                         }
-                        if (segmentCount > 0 && nextInit != init) return MediaPrefix(prefix, true)
+                        if (segmentCount > 0 && nextInit != init) return result(IntroAudioScanCoverage.TIMELINE_BOUNDARY)
                         init = nextInit
                         pendingMap = null
                     }
@@ -464,7 +486,7 @@ internal class IntroAudioExtractor(context: Context) {
             }
         }
         if (segmentCount == 0) throw invalidPlaylist()
-        return MediaPrefix(prefix, false)
+        return result(IntroAudioScanCoverage.FULL)
     }
 
     private fun encryption(base: String, keys: Map<String, KeyTag>, sequence: ULong?): Encryption? {
@@ -609,6 +631,8 @@ internal class IntroAudioExtractor(context: Context) {
                 }
             } catch (timeout: IntroAudioResponseTimeout) {
                 throw timeout
+            } catch (limit: IntroAudioSizeLimit) {
+                throw limit
             } catch (_: IOException) {
                 budget.check()
                 throw IntroAudioScanException("无法读取 HLS 解密密钥，请确认这条线路可正常播放。")
@@ -727,19 +751,22 @@ internal class IntroAudioExtractor(context: Context) {
 
         private fun invalidEncryptedSegment() = IntroAudioScanException("HLS 分片无法用片源提供的 AES-128 密钥解密。")
 
-        private fun remaining(): Long = minOf(EpisodeByteLimit - episodeBytes.get(), budget.remainingBytes()).coerceAtLeast(0L)
+        fun remaining(): Long = minOf(EpisodeByteLimit - episodeBytes.get(), budget.remainingBytes()).coerceAtLeast(0L)
 
         private fun readBytes(input: InputStream, buffer: ByteArray, offset: Int, length: Int): Int {
-            // A concurrent stream can consume the remaining allowance while this read is
-            // in flight. Recheck after reading, before passing any excess data to the caller.
-            val allowed = minOf(length.toLong(), remaining()).toInt()
-            if (allowed == 0) throw scanSizeLimit()
-            val size = input.read(buffer, offset, allowed)
-            if (size > 0) {
-                budget.addBytes(size)
-                if (episodeBytes.addAndGet(size.toLong()) > EpisodeByteLimit) throw scanSizeLimit()
+            // Reserve before reading so concurrent responses share the same hard limits.
+            val episodeReservation = reserveReadBytes(episodeBytes, EpisodeByteLimit, length)
+            val allowed = budget.reserveBytes(episodeReservation)
+            var size = 0
+            try {
+                if (allowed == 0) throw scanSizeLimit()
+                size = input.read(buffer, offset, allowed)
+                return size
+            } finally {
+                val consumed = size.coerceAtLeast(0)
+                budget.releaseBytes(allowed - consumed)
+                episodeBytes.addAndGet((consumed - episodeReservation).toLong())
             }
-            return size
         }
     }
 

@@ -259,26 +259,28 @@ fun PlayerScreen(
             val first = currentEpisode ?: return@LaunchedEffect
             val second = introReference ?: return@LaunchedEffect
             if (!active || !introPanelOpen || !windowFocused) return@LaunchedEffect
-            val (match, limitedByBoundary) = withContext(Dispatchers.IO) {
+            val (match, scanCoverage) = withContext(Dispatchers.IO) {
                 val currentMedia = resolvePlaybackEpisode(first)
                 val referenceMedia = resolvePlaybackEpisode(second)
                 val scanContext = currentCoroutineContext()
                 val budget = IntroAudioScanBudget { !scanContext.isActive }
                 val extractor = IntroAudioExtractor(context.applicationContext)
                 val current = IntroAudioFingerprint.Collector()
-                val currentLimited = extractor.scan(currentMedia.url, budget, currentMedia.headers, current::appendPcm16)
+                val currentCoverage = extractor.scan(currentMedia.url, budget, currentMedia.headers, current::appendPcm16)
                 val reference = IntroAudioFingerprint.Collector()
-                val referenceLimited = extractor.scan(referenceMedia.url, budget, referenceMedia.headers, reference::appendPcm16)
-                IntroAudioFingerprint.match(current.finish(), reference.finish(), budget::check) to (currentLimited || referenceLimited)
+                val referenceCoverage = extractor.scan(referenceMedia.url, budget, referenceMedia.headers, reference::appendPcm16)
+                IntroAudioFingerprint.match(current.finish(), reference.finish(), budget::check) to setOf(currentCoverage, referenceCoverage)
             }
             currentCoroutineContext().ensureActive()
             if (detectionRequest !== request || panel != IntroSettingsPanel ||
                 !activeNow.value || latestPlaybackKey != playbackKey) return@LaunchedEffect
             if (match == null) {
-                detectionMessage = if (limitedByBoundary) {
-                    "HLS 开头的时间轴有跳变，连续区间内未找到完整片头。可以手动设置片头结束点。"
-                } else {
-                    "前 3 分钟内没有找到可靠的重复片头"
+                detectionMessage = when {
+                    IntroAudioScanCoverage.BYTE_LIMIT in scanCoverage ->
+                        "流量上限内未找到完整片头。可以换低码率线路，或手动设置片头结束点。"
+                    IntroAudioScanCoverage.TIMELINE_BOUNDARY in scanCoverage ->
+                        "HLS 开头的时间轴有跳变，连续区间内未找到完整片头。可以手动设置片头结束点。"
+                    else -> "前 3 分钟内没有找到可靠的重复片头"
                 }
             } else {
                 val range = DetectedIntro(match.startMillis, match.endMillis)
