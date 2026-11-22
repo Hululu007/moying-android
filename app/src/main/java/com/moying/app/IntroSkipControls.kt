@@ -30,15 +30,19 @@ internal fun IntroSkipSettings(
     manualEndMillis: Long?,
     detected: DetectedIntro?,
     autoSkip: Boolean,
+    autoDetectNext: Boolean,
+    canAutoDetectNext: Boolean,
     currentMillis: Long,
     canSetEnd: Boolean,
     canDetect: Boolean,
     detecting: Boolean,
     playing: Boolean,
     detectionMessage: String?,
+    nextDetectionMessage: String?,
     onDetect: () -> Unit,
     onSetEnd: () -> Unit,
     onAutoSkipChange: (Boolean) -> Unit,
+    onAutoDetectNextChange: (Boolean) -> Unit,
     onClear: () -> Unit,
 ) {
     val hasIntro = manualEndMillis != null || detected != null
@@ -83,44 +87,15 @@ internal fun IntroSkipSettings(
             primary = false,
             enabled = canSetEnd && !detecting,
         )
-        val checked = hasIntro && autoSkip
-        val feedback = LocalInteractionHaptics.current
-        Row(
-            Modifier.fillMaxWidth().heightIn(min = Theme.Size.Touch)
-                .clip(RoundedCornerShape(Theme.Radius.Control))
-                .toggleable(
-                    value = checked,
-                    enabled = hasIntro,
-                    role = Role.Switch,
-                    onValueChange = {
-                        feedback.tap()
-                        onAutoSkipChange(it)
-                    },
-                )
-                .padding(horizontal = Theme.Space.Small),
-            horizontalArrangement = Arrangement.spacedBy(Theme.Space.Small),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
+        IntroSkipToggle("自动跳过片头", hasIntro && autoSkip, hasIntro, onAutoSkipChange)
+        IntroSkipToggle("临近看完时识别下一集", autoDetectNext, canAutoDetectNext, onAutoDetectNextChange)
+        AppText("仅在非计费网络播放时识别。", style = Theme.Type.Caption, color = Theme.Colors.Secondary)
+        if (nextDetectionMessage != null) {
             AppText(
-                "自动跳过片头",
-                modifier = Modifier.weight(1f),
-                style = Theme.Type.Label,
-                color = if (hasIntro) Theme.Colors.Text else Theme.Colors.Muted,
+                nextDetectionMessage,
+                style = Theme.Type.Caption,
+                color = Theme.Colors.Secondary,
             )
-            Box(
-                Modifier.size(width = 44.dp, height = 26.dp)
-                    .background(
-                        if (checked) Theme.Colors.Accent else Theme.Colors.Border,
-                        RoundedCornerShape(Theme.Radius.Pill),
-                    )
-                    .padding(3.dp),
-                contentAlignment = if (checked) Alignment.CenterEnd else Alignment.CenterStart,
-            ) {
-                Box(
-                    Modifier.size(20.dp)
-                        .background(Theme.Colors.OnMedia, RoundedCornerShape(Theme.Radius.Pill)),
-                )
-            }
         }
         if (hasIntro) {
             ActionButton(
@@ -129,6 +104,48 @@ internal fun IntroSkipSettings(
                 modifier = Modifier.fillMaxWidth(),
                 primary = false,
                 enabled = !detecting,
+            )
+        }
+    }
+}
+
+@Composable
+private fun IntroSkipToggle(label: String, checked: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) {
+    val feedback = LocalInteractionHaptics.current
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = Theme.Size.Touch)
+            .clip(RoundedCornerShape(Theme.Radius.Control))
+            .toggleable(
+                value = checked,
+                enabled = enabled,
+                role = Role.Switch,
+                onValueChange = {
+                    feedback.tap()
+                    onChange(it)
+                },
+            )
+            .padding(horizontal = Theme.Space.Small),
+        horizontalArrangement = Arrangement.spacedBy(Theme.Space.Small),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        AppText(
+            label,
+            modifier = Modifier.weight(1f),
+            style = Theme.Type.Label,
+            color = if (enabled) Theme.Colors.Text else Theme.Colors.Muted,
+        )
+        Box(
+            Modifier.size(width = 44.dp, height = 26.dp)
+                .background(
+                    if (checked) Theme.Colors.Accent else Theme.Colors.Border,
+                    RoundedCornerShape(Theme.Radius.Pill),
+                )
+                .padding(3.dp),
+            contentAlignment = if (checked) Alignment.CenterEnd else Alignment.CenterStart,
+        ) {
+            Box(
+                Modifier.size(20.dp)
+                    .background(Theme.Colors.OnMedia, RoundedCornerShape(Theme.Radius.Pill)),
             )
         }
     }

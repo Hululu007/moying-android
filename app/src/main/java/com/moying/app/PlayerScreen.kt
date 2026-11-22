@@ -1,6 +1,11 @@
 package com.moying.app
 
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -34,13 +39,55 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 private val PlaybackToggleIconOffset = Theme.Size.PlayerIconInset - Theme.Size.PlayerRowShift
 private const val IntroSettingsPanel = "片头设置"
 private const val MinimumIntroEndMillis = 1_000L
+private const val NextIntroWindowMillis = 120_000L
+
+internal fun isNearEpisodeEnd(positionMillis: Long, durationMillis: Long): Boolean =
+    positionMillis > 0L && positionMillis < durationMillis &&
+        durationMillis - positionMillis <= minOf(NextIntroWindowMillis, durationMillis / 4L)
+
+@Composable
+private fun rememberIntroUnmeteredNetwork(enabled: Boolean): Boolean {
+    val context = LocalContext.current.applicationContext
+    val connectivity = remember(context) { context.getSystemService(ConnectivityManager::class.java) }
+    var unmetered by remember(enabled, connectivity) { mutableStateOf(false) }
+    DisposableEffect(enabled, connectivity) {
+        if (!enabled || connectivity == null) return@DisposableEffect onDispose { }
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            private var defaultNetwork: Network? = null
+
+            override fun onAvailable(network: Network) {
+                defaultNetwork = network
+                unmetered = false
+            }
+
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+                if (network == defaultNetwork) {
+                    unmetered = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                }
+            }
+
+            override fun onLost(network: Network) {
+                if (network == defaultNetwork) {
+                    defaultNetwork = null
+                    unmetered = false
+                }
+            }
+        }
+        val registered = runCatching {
+            connectivity.registerDefaultNetworkCallback(callback, Handler(Looper.getMainLooper()))
+        }.isSuccess
+        onDispose {
+            if (registered) runCatching { connectivity.unregisterNetworkCallback(callback) }
+        }
+    }
+    return unmetered
+}
 
 /** 输入：影片、续播记录、数据/播放接口；输出：支持手势、预载、换源和选集的播放页。 */
 @Composable
@@ -97,7 +144,9 @@ fun PlayerScreen(
     val currentIndex = episode - Playback.FirstEpisode
     val currentEpisode = episodes.getOrNull(currentIndex)
     val currentUrl = currentEpisode?.url.orEmpty()
-    val introReference = episodes.getOrNull(currentIndex + 1)?.takeIf { it.url.isNotBlank() && it.url != currentUrl }
+    val nextEpisode = episodes.getOrNull(currentIndex + 1)
+    val nextIntroReference = nextEpisode?.takeIf { it.url.isNotBlank() && it.url != currentUrl }
+    val introReference = nextIntroReference
         ?: episodes.getOrNull(currentIndex - 1)?.takeIf { it.url.isNotBlank() && it.url != currentUrl }
     val playbackKey = ContentCacheKey.root(movie.id, routeId, episode)
     val needsResolution = currentEpisode?.resolver != null
@@ -108,6 +157,7 @@ fun PlayerScreen(
     val introPreferences = remember(context, movie.id, route.id) {
         IntroSkipPreferences(context.applicationContext, movie.id, route.id)
     }
+    val introRecognition = remember(introPreferences) { IntroRecognition(context) }
     var introRule by remember(introPreferences) { mutableStateOf(introPreferences.read()) }
     var introChecked by rememberSaveable(playbackKey) { mutableStateOf(false) }
     var detectedIntro by remember(introPreferences, currentEpisode) {
@@ -121,6 +171,14 @@ fun PlayerScreen(
     val windowFocused = LocalWindowInfo.current.isWindowFocused
     val currentMediaReady = loadedPlaybackKey == playbackKey && playbackSession.selection?.key == playbackKey &&
         controller.errorMessage == null && !controller.isBuffering
+    var nextIntroAttempted by rememberSaveable(playbackKey, currentUrl, nextIntroReference) { mutableStateOf(false) }
+    var nextIntroRunning by remember(playbackKey, currentEpisode, nextIntroReference) { mutableStateOf(false) }
+    var nextIntroMessage by remember(playbackKey, currentEpisode, nextIntroReference) { mutableStateOf<String?>(null) }
+    val unmeteredIntro = rememberIntroUnmeteredNetwork(active && introRule.autoDetectNext && nextIntroReference != null)
+    val canPrepareNextIntro = active && surfaceVisible && windowFocused && currentMediaReady && controller.isPlaying &&
+        introRule.autoDetectNext && introRule.endMillis == 0L && unmeteredIntro && request == null &&
+        isNearEpisodeEnd(position, knownDuration)
+    val latestNextIntroEligibility by rememberUpdatedState(canPrepareNextIntro)
     val canSkipIntro = if (introRule.endMillis > 0L) introRule.canSkip(position, knownDuration)
         else detectedIntro?.canSkip(position, knownDuration) == true
     val showIntroSkip = active && currentMediaReady && canSkipIntro
@@ -129,7 +187,6 @@ fun PlayerScreen(
     // 控制栏在相邻页也会先组合一次，回调必须读取最新的 active，不能依赖闭包里的首帧值。
     val activeNow = rememberUpdatedState(active)
     val videoAspect = controller.videoAspectRatio?.takeIf { playbackSession.selection?.movieId == movie.id } ?: Theme.Size.VideoAspect
-    val nextEpisode = episodes.getOrNull(episode)
     val nextBufferLabel = when {
         nextEpisode == null -> null
         nextEpisode.resolver != null -> "下一集将在播放时解析"
@@ -259,18 +316,7 @@ fun PlayerScreen(
             val first = currentEpisode ?: return@LaunchedEffect
             val second = introReference ?: return@LaunchedEffect
             if (!active || !introPanelOpen || !windowFocused) return@LaunchedEffect
-            val (match, scanCoverage) = withContext(Dispatchers.IO) {
-                val currentMedia = resolvePlaybackEpisode(first)
-                val referenceMedia = resolvePlaybackEpisode(second)
-                val scanContext = currentCoroutineContext()
-                val budget = IntroAudioScanBudget { !scanContext.isActive }
-                val extractor = IntroAudioExtractor(context.applicationContext)
-                val current = IntroAudioFingerprint.Collector()
-                val currentCoverage = extractor.scan(currentMedia.url, budget, currentMedia.headers, current::appendPcm16)
-                val reference = IntroAudioFingerprint.Collector()
-                val referenceCoverage = extractor.scan(referenceMedia.url, budget, referenceMedia.headers, reference::appendPcm16)
-                IntroAudioFingerprint.match(current.finish(), reference.finish(), budget::check) to setOf(currentCoverage, referenceCoverage)
-            }
+            val (match, scanCoverage) = introRecognition.compare(first, second)
             currentCoroutineContext().ensureActive()
             if (detectionRequest !== request || panel != IntroSettingsPanel ||
                 !activeNow.value || latestPlaybackKey != playbackKey) return@LaunchedEffect
@@ -300,6 +346,47 @@ fun PlayerScreen(
             detectionMessage = "暂时无法识别此线路的音频"
         } finally {
             if (detectionRequest === request) detectionRequest = null
+        }
+    }
+    LaunchedEffect(canPrepareNextIntro, playbackKey, currentEpisode, nextIntroReference, introRecognition) {
+        val current = currentEpisode ?: return@LaunchedEffect
+        val next = nextIntroReference ?: return@LaunchedEffect
+        if (!canPrepareNextIntro || nextIntroAttempted || current.url.isBlank()) return@LaunchedEffect
+        if (introPreferences.readDetection(next) != null) {
+            nextIntroMessage = "已识别下一集片头"
+            return@LaunchedEffect
+        }
+
+        nextIntroAttempted = true
+        nextIntroRunning = true
+        nextIntroMessage = null
+        try {
+            if (!controller.nextPreloadReady) {
+                playbackSession.preload(RetainedPlayback(movie.id, routeId, next.number, ""))
+            }
+            val (match, _) = introRecognition.compare(current, next, background = true)
+            currentCoroutineContext().ensureActive()
+            if (!latestNextIntroEligibility || latestPlaybackKey != playbackKey ||
+                playbackSession.selection?.key != playbackKey) return@LaunchedEffect
+            if (match == null) {
+                nextIntroMessage = "未找到下一集的完整片头，可手动识别"
+            } else {
+                val nextRange = DetectedIntro(match.referenceStartMillis, match.referenceEndMillis)
+                if (introPreferences.readDetection(current) == null) {
+                    val currentRange = DetectedIntro(match.startMillis, match.endMillis)
+                    introPreferences.saveDetections(current, currentRange, next, nextRange)
+                    detectedIntro = currentRange
+                } else {
+                    introPreferences.saveDetection(next, nextRange)
+                }
+                nextIntroMessage = "已识别下一集片头"
+            }
+        } catch (error: CancellationException) {
+            throw error
+        } catch (_: Exception) {
+            nextIntroMessage = "未能识别下一集片头，可手动重试"
+        } finally {
+            nextIntroRunning = false
         }
     }
     LaunchedEffect(playbackKey, currentEpisode, active, canResolve, resolutionAttempt) {
@@ -342,7 +429,9 @@ fun PlayerScreen(
                 }
             }
             // 控制器结合当前集余量、倍速与缓冲状态决定是否启动/暂停下一集 native 预准备。
-            playbackSession.preload(RetainedPlayback(movie.id, routeId, episode + Playback.FirstEpisode, next?.url.orEmpty(), next?.headers.orEmpty()))
+            if (!nextIntroRunning) {
+                playbackSession.preload(RetainedPlayback(movie.id, routeId, episode + Playback.FirstEpisode, next?.url.orEmpty(), next?.headers.orEmpty()))
+            }
             if (System.currentTimeMillis() - lastSave >= Theme.Motion.HistorySaveMillis) {
                 saveProgress(); lastSave = System.currentTimeMillis()
             }
@@ -540,12 +629,19 @@ fun PlayerScreen(
                                 manualEndMillis = introRule.endMillis.takeIf { it > 0L },
                                 detected = detectedIntro,
                                 autoSkip = introRule.automatic,
+                                autoDetectNext = introRule.autoDetectNext,
+                                canAutoDetectNext = episodes.size > 1,
                                 currentMillis = position,
                                 canSetEnd = currentMediaReady && position in MinimumIntroEndMillis until knownDuration,
                                 canDetect = currentUrl.isNotBlank() && introReference != null,
                                 detecting = request != null,
                                 playing = controller.isPlaying,
                                 detectionMessage = detectionMessage,
+                                nextDetectionMessage = when {
+                                    !introRule.autoDetectNext -> null
+                                    nextIntroRunning -> "正在识别下一集片头…"
+                                    else -> nextIntroMessage
+                                },
                                 onDetect = {
                                     if (detectionRequest != null) {
                                         detectionRequest = null
@@ -566,9 +662,10 @@ fun PlayerScreen(
                                     }
                                 },
                                 onAutoSkipChange = { updateIntroRule(introRule.copy(automatic = it)) },
+                                onAutoDetectNextChange = { updateIntroRule(introRule.copy(autoDetectNext = it)) },
                                 onClear = {
                                     if (introRule.endMillis > 0L) {
-                                        updateIntroRule(IntroSkipRule(automatic = detectedIntro != null && introRule.automatic))
+                                        updateIntroRule(introRule.copy(endMillis = 0L, automatic = detectedIntro != null && introRule.automatic))
                                     } else {
                                         currentEpisode?.let(introPreferences::clearDetection)
                                         detectedIntro = null

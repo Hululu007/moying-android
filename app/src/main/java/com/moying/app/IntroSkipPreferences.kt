@@ -2,7 +2,11 @@ package com.moying.app
 
 import android.content.Context
 
-internal data class IntroSkipRule(val endMillis: Long = 0L, val automatic: Boolean = false) {
+internal data class IntroSkipRule(
+    val endMillis: Long = 0L,
+    val automatic: Boolean = false,
+    val autoDetectNext: Boolean = false,
+) {
     fun canSkip(position: Long, duration: Long): Boolean = position < endMillis && endMillis in 1L until duration
 }
 
@@ -17,13 +21,19 @@ internal class IntroSkipPreferences(context: Context, movieId: String, routeId: 
     private val key = "${movieId.length}:$movieId$routeId"
     private val endKey = "$key:end"
     private val autoKey = "$key:auto"
+    private val autoDetectNextKey = "$key:auto-detect-next"
 
-    fun read(): IntroSkipRule = IntroSkipRule(preferences.getLong(endKey, 0L), preferences.getBoolean(autoKey, false))
+    fun read(): IntroSkipRule = IntroSkipRule(
+        endMillis = preferences.getLong(endKey, 0L),
+        automatic = preferences.getBoolean(autoKey, false),
+        autoDetectNext = preferences.getBoolean(autoDetectNextKey, false),
+    )
 
     fun write(rule: IntroSkipRule) {
         val editor = preferences.edit()
         if (rule.endMillis > 0L) editor.putLong(endKey, rule.endMillis) else editor.remove(endKey)
         if (rule.automatic) editor.putBoolean(autoKey, true) else editor.remove(autoKey)
+        if (rule.autoDetectNext) editor.putBoolean(autoDetectNextKey, true) else editor.remove(autoDetectNextKey)
         editor.apply()
     }
 
@@ -40,6 +50,10 @@ internal class IntroSkipPreferences(context: Context, movieId: String, routeId: 
             .putString(episodeKey(current), encode(current, range))
             .putString(episodeKey(reference), encode(reference, referenceRange))
             .apply()
+    }
+
+    fun saveDetection(episode: Episode, range: DetectedIntro) {
+        preferences.edit().putString(episodeKey(episode), encode(episode, range)).apply()
     }
 
     fun clearDetection(episode: Episode) {

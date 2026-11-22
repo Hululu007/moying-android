@@ -38,7 +38,11 @@ internal enum class IntroAudioScanCoverage { FULL, TIMELINE_BOUNDARY, BYTE_LIMIT
 private const val EpisodeByteLimit = 48L * 1024L * 1024L
 
 /** One budget covers both episodes in a comparison. */
-internal class IntroAudioScanBudget(private val isCancelled: () -> Boolean = { false }) {
+internal class IntroAudioScanBudget(
+    background: Boolean = false,
+    private val isCancelled: () -> Boolean = { false },
+) {
+    val hlsDownloadWorkers = if (background) 1 else 4
     private val deadline = SystemClock.elapsedRealtime() + 75_000L
     private val bytesRead = AtomicLong()
 
@@ -303,7 +307,7 @@ internal class IntroAudioExtractor(context: Context) {
         // Each retry rewinds its own part, including encrypted and byte-range resources.
         val directory = File(file.parentFile, "${file.name}.parts")
         if (!directory.mkdir()) throw IOException("Could not create HLS scan directory")
-        val workers = Executors.newFixedThreadPool(minOf(HlsDownloadWorkers, resources.size))
+        val workers = Executors.newFixedThreadPool(minOf(budget.hlsDownloadWorkers, resources.size))
         val pending = ArrayDeque<Pair<File, Future<*>>>()
         var next = 0
         var stopped = false
@@ -334,7 +338,7 @@ internal class IntroAudioExtractor(context: Context) {
                 var completed = 0
                 while (completed < resources.size) {
                     // Drain existing requests near the limit, then give the next segment priority.
-                    val window = if (network.remaining() > 2L * SegmentBytes) HlsDownloadWorkers else 1
+                    val window = if (network.remaining() > 2L * SegmentBytes) budget.hlsDownloadWorkers else 1
                     while (next < resources.size && pending.size < window) enqueue()
                     val (part, future) = pending.first()
                     try {
@@ -817,7 +821,6 @@ internal class IntroAudioExtractor(context: Context) {
     private companion object {
         const val ScanDurationUs = 180_000_000L
         const val SegmentLimit = 120
-        const val HlsDownloadWorkers = 4
         const val ManifestBytes = 512 * 1024
         const val ProbeBytes = 4 * 1024
         const val SegmentBytes = 12 * 1024 * 1024

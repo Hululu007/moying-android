@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Bundle
 import android.os.SystemClock
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.runBlocking
 import java.util.zip.CRC32
 import kotlin.math.abs
 
@@ -143,6 +144,21 @@ internal object IntroAudioExtractorRegression {
             check(IntroAudioFingerprint.match(second, first, budget::check) == null) { "Matched an intro cut by the HLS byte limit" }
             verifyRejected("byte-limit/init-only/episode-1/index.m3u8", "流量上限")
             result.putString("HLS byte limit with no complete intro", "rejected partial match and init-only media")
+        }
+        if (args.getString("introNextFixture") == "true") {
+            runBlocking {
+                val recognition = IntroRecognition(context)
+                val first = Episode(1, "First", "$base/hls/episode-1/index.m3u8")
+                val second = Episode(2, "Second", "$base/next-intro/episode-2/index.m3u8")
+                val third = Episode(3, "Third", "$base/hls/episode-1/index.m3u8?episode=3")
+                val pending = checkNotNull(recognition.compare(first, second, background = true).match)
+                check(abs(pending.referenceEndMillis - 32_000L) < 1_000L)
+                // The fixture serves the second episode's playlist once. A second comparison
+                // can only succeed by using the fingerprint already read for that episode.
+                val following = checkNotNull(recognition.compare(second, third, background = true).match)
+                check(abs(following.referenceEndMillis - 28_000L) < 1_000L)
+                result.putString("next episode intro recognition", "matched two consecutive pairs and reused the previous fingerprint")
+            }
         }
         check(runCatching { read("episode-1.mp4", IntroAudioScanBudget { true }) }.exceptionOrNull() is CancellationException)
         result.putString("rejections", "live HLS, missing and invalid AES-128 keys, SAMPLE-AES, DRM, cancelled scan")

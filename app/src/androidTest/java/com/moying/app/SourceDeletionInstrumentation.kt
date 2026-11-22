@@ -54,6 +54,7 @@ class SourceDeletionInstrumentation : Instrumentation() {
                 return
             }
             "intro-audio-extractor" -> { runSuite { IntroAudioExtractorRegression.run(targetContext, suiteArguments) }; return }
+            "intro-next-detection" -> { runSuite { introNextDetectionRegression() }; return }
             "native-player" -> { runSuite { NativePlayerRegression.run(this, suiteArguments) }; return }
             "glass-idle" -> { runSuite { GlassIdleRegression.run(this, suiteArguments) }; return }
             "offline-playback" -> { runSuite { OfflinePlaybackRegression.run() }; return }
@@ -561,6 +562,62 @@ class SourceDeletionInstrumentation : Instrumentation() {
                 putInt("subscriptionFirstCatalogItems", checkNotNull(catalog) { "前 3 个新 CMS 均未返回影片" })
             }
         }
+    }
+
+    private fun introNextDetectionRegression(): Bundle {
+        IsolatedPreferencesContext(targetContext).use { isolated ->
+            fun rules(movieId: String = "series", routeId: String = "main") =
+                IntroSkipPreferences(isolated, movieId, routeId)
+
+            val preferences = rules()
+            check(preferences.read() == IntroSkipRule())
+            preferences.write(IntroSkipRule(endMillis = 60_000L, automatic = true))
+            check(!rules().read().autoDetectNext)
+
+            val enabled = IntroSkipRule(endMillis = 45_000L, autoDetectNext = true)
+            preferences.write(enabled)
+            check(rules().read() == enabled)
+            check(rules(routeId = "backup").read() == IntroSkipRule())
+            check(rules(movieId = "other").read() == IntroSkipRule())
+
+            val bothEnabled = enabled.copy(automatic = true)
+            preferences.write(bothEnabled)
+            check(rules().read() == bothEnabled)
+            val nextDisabled = bothEnabled.copy(autoDetectNext = false)
+            preferences.write(nextDisabled)
+            check(rules().read() == nextDisabled)
+
+            val current = Episode(1, "Episode 1", "https://fixture.invalid/first.mp4")
+            val next = Episode(2, "Episode 2", "https://fixture.invalid/second.mp4")
+            val currentRange = DetectedIntro(10_000L, 22_000L)
+            val nextRange = DetectedIntro(14_000L, 26_000L)
+            preferences.saveDetection(current, currentRange)
+            check(rules().readDetection(next) == null)
+            preferences.saveDetection(next, nextRange)
+            check(rules().readDetection(current) == currentRange)
+            check(rules().readDetection(next) == nextRange)
+            check(rules().readDetection(next.copy(url = "https://fixture.invalid/new.mp4")) == null)
+            check(rules(routeId = "backup").readDetection(next) == null)
+            check(rules().read() == nextDisabled)
+        }
+
+        fun checkWindow(position: Long, duration: Long, expected: Boolean) {
+            check(isNearEpisodeEnd(position, duration) == expected) {
+                "Unexpected next-episode trigger at position=$position duration=$duration, expected $expected"
+            }
+        }
+        checkWindow(1_079_999L, 1_200_000L, false)
+        checkWindow(1_080_000L, 1_200_000L, true)
+        checkWindow(1_199_999L, 1_200_000L, true)
+        checkWindow(1_200_000L, 1_200_000L, false)
+        checkWindow(1_200_001L, 1_200_000L, false)
+        checkWindow(29_999L, 40_000L, false)
+        checkWindow(30_000L, 40_000L, true)
+        checkWindow(0L, 40_000L, false)
+        checkWindow(-1L, 40_000L, false)
+        checkWindow(1L, 0L, false)
+        checkWindow(1L, -1L, false)
+        return Bundle().apply { putString("introNextDetection", "passed") }
     }
 
     private fun runSuite(action: () -> Bundle) {
